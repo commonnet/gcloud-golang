@@ -20,6 +20,7 @@ package spannertest
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -33,7 +34,7 @@ type evalContext struct {
 	params queryParams
 }
 
-func (d *database) evalSelect(sel spansql.Select, params queryParams, aux []spansql.Expr) (*resultIter, error) {
+func (d *database) evalSelect(sel spansql.Select, params queryParams, aux []spansql.Expr) (ri *resultIter, evalErr error) {
 	// TODO: weave this in below.
 	if len(sel.From) == 0 && sel.Where == nil {
 		// Simple expressions.
@@ -69,6 +70,26 @@ func (d *database) evalSelect(sel spansql.Select, params queryParams, aux []span
 		return nil, err
 	}
 
+	ri = &resultIter{}
+
+	// Handle COUNT(*) specially.
+	// TODO: Handle aggregation more generally.
+	if len(sel.List) == 1 && isCountStar(sel.List[0]) {
+		// Replace the `COUNT(*)` with `1`, then aggregate on the way out.
+		sel.List[0] = spansql.IntegerLiteral(1)
+		defer func() {
+			if evalErr != nil {
+				return
+			}
+			count := int64(len(ri.rows))
+			ri.rows = []resultRow{
+				{data: []interface{}{count}},
+			}
+		}()
+	}
+
+	// TODO: Support table sampling.
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	ec := evalContext{
@@ -76,7 +97,6 @@ func (d *database) evalSelect(sel spansql.Select, params queryParams, aux []span
 		params: params,
 	}
 
-	ri := &resultIter{}
 	for _, e := range sel.List {
 		ci, err := ec.colInfo(e)
 		if err != nil {
@@ -133,8 +153,8 @@ func (ec evalContext) evalBoolExpr(be spansql.BoolExpr) (bool, error) {
 		return false, fmt.Errorf("unhandled BoolExpr %T", be)
 	case spansql.BoolLiteral:
 		return bool(be), nil
-	case spansql.ID:
-		e, err := ec.evalID(be)
+	case spansql.ID, spansql.Paren:
+		e, err := ec.evalExpr(be)
 		if err != nil {
 			return false, err
 		}
@@ -180,7 +200,7 @@ func (ec evalContext) evalBoolExpr(be spansql.BoolExpr) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		switch be.Op { // TODO: Like, NotLike
+		switch be.Op {
 		default:
 			return false, fmt.Errorf("TODO: ComparisonOp %d", be.Op)
 		case spansql.Lt:
@@ -195,6 +215,33 @@ func (ec evalContext) evalBoolExpr(be spansql.BoolExpr) (bool, error) {
 			return compareVals(lhs, rhs) == 0, nil
 		case spansql.Ne:
 			return compareVals(lhs, rhs) != 0, nil
+		case spansql.Like, spansql.NotLike:
+			left, ok := lhs.(string)
+			if !ok {
+				// TODO: byte works here too?
+				return false, fmt.Errorf("LHS of LIKE is %T, not string", lhs)
+			}
+			right, ok := rhs.(string)
+			if !ok {
+				// TODO: byte works here too?
+				return false, fmt.Errorf("RHS of LIKE is %T, not string", rhs)
+			}
+
+			match := evalLike(left, right)
+			if be.Op == spansql.NotLike {
+				match = !match
+			}
+			return match, nil
+		case spansql.Between, spansql.NotBetween:
+			rhs2, err := ec.evalExpr(be.RHS2)
+			if err != nil {
+				return false, err
+			}
+			b := compareVals(rhs, lhs) <= 0 && compareVals(lhs, rhs2) <= 0
+			if be.Op == spansql.NotBetween {
+				b = !b
+			}
+			return b, nil
 		}
 	case spansql.IsOp:
 		lhs, err := ec.evalExpr(be.LHS)
@@ -239,10 +286,14 @@ func (ec evalContext) evalExpr(e spansql.Expr) (interface{}, error) {
 		return float64(e), nil
 	case spansql.StringLiteral:
 		return string(e), nil
+	case spansql.BytesLiteral:
+		return []byte(e), nil
 	case spansql.NullLiteral:
 		return nil, nil
 	case spansql.BoolLiteral:
 		return bool(e), nil
+	case spansql.Paren:
+		return ec.evalExpr(e.Expr)
 	case spansql.LogicalOp:
 		return ec.evalBoolExpr(e)
 	case spansql.IsOp:
@@ -259,7 +310,7 @@ func (ec evalContext) evalID(id spansql.ID) (interface{}, error) {
 	if !ok {
 		return nil, fmt.Errorf("couldn't resolve identifier %s", string(id))
 	}
-	return ec.row[i], nil
+	return ec.row.copyDataElem(i), nil
 }
 
 func evalLimit(lim spansql.Limit, params queryParams) (int64, error) {
@@ -340,6 +391,7 @@ func compareVals(x, y interface{}) int {
 		}
 		return 0
 	case string:
+		// This handles DATE too.
 		return strings.Compare(x, y.(string))
 	}
 }
@@ -351,6 +403,8 @@ func (ec evalContext) colInfo(e spansql.Expr) (colInfo, error) {
 		return colInfo{Type: spansql.Type{Base: spansql.Int64}}, nil
 	case spansql.StringLiteral:
 		return colInfo{Type: spansql.Type{Base: spansql.String}}, nil
+	case spansql.BytesLiteral:
+		return colInfo{Type: spansql.Type{Base: spansql.Bytes}}, nil
 	case spansql.LogicalOp, spansql.ComparisonOp, spansql.IsOp:
 		return colInfo{Type: spansql.Type{Base: spansql.Bool}}, nil
 	case spansql.ID:
@@ -361,10 +415,41 @@ func (ec evalContext) colInfo(e spansql.Expr) (colInfo, error) {
 				return ec.table.cols[i], nil
 			}
 		}
+	case spansql.Paren:
+		return ec.colInfo(e.Expr)
 	case spansql.NullLiteral:
 		// There isn't necessarily something sensible here.
 		// Empirically, though, the real Spanner returns Int64.
 		return colInfo{Type: spansql.Type{Base: spansql.Int64}}, nil
 	}
 	return colInfo{}, fmt.Errorf("can't deduce column type from expression [%s]", e.SQL())
+}
+
+func evalLike(str, pat string) bool {
+	/*
+		% matches any number of chars.
+		_ matches a single char.
+		TODO: handle escaping
+	*/
+
+	// Lean on regexp for simplicity.
+	pat = regexp.QuoteMeta(pat)
+	pat = strings.Replace(pat, "%", ".*", -1)
+	pat = strings.Replace(pat, "_", ".", -1)
+	match, err := regexp.MatchString(pat, str)
+	if err != nil {
+		panic(fmt.Sprintf("internal error: constructed bad regexp /%s/: %v", pat, err))
+	}
+	return match
+}
+
+func isCountStar(e spansql.Expr) bool {
+	f, ok := e.(spansql.Func)
+	if !ok {
+		return false
+	}
+	if f.Name != "COUNT" || len(f.Args) != 1 {
+		return false
+	}
+	return f.Args[0] == spansql.Star
 }

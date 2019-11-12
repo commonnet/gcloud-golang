@@ -80,6 +80,8 @@ func getClient(t *testing.T) *Client {
 	return client
 }
 
+var grpcHeadersChecker = testutil.DefaultHeadersEnforcer()
+
 // If integration tests will be run, create a unique dataset for them.
 // Return a cleanup function.
 func initIntegrationTest() func() {
@@ -137,8 +139,8 @@ func initIntegrationTest() func() {
 			log.Println("Integration tests skipped. See CONTRIBUTING.md for details")
 			return func() {}
 		}
-		bqOpt := option.WithTokenSource(ts)
-		sOpt := option.WithTokenSource(testutil.TokenSource(ctx, storage.ScopeFullControl))
+		bqOpts := []option.ClientOption{option.WithTokenSource(ts)}
+		sOpts := []option.ClientOption{option.WithTokenSource(testutil.TokenSource(ctx, storage.ScopeFullControl))}
 		cleanup := func() {}
 		now := time.Now().UTC()
 		if *record {
@@ -154,29 +156,35 @@ func initIntegrationTest() func() {
 					log.Fatalf("could not record: %v", err)
 				}
 				log.Printf("recording to %s", replayFilename)
-				hc, err := recorder.Client(ctx, bqOpt)
+				hc, err := recorder.Client(ctx, bqOpts...)
 				if err != nil {
 					log.Fatal(err)
 				}
-				bqOpt = option.WithHTTPClient(hc)
-				hc, err = recorder.Client(ctx, sOpt)
+				bqOpts = append(bqOpts, option.WithHTTPClient(hc))
+				hc, err = recorder.Client(ctx, sOpts...)
 				if err != nil {
 					log.Fatal(err)
 				}
-				sOpt = option.WithHTTPClient(hc)
+				sOpts = append(sOpts, option.WithHTTPClient(hc))
 				cleanup = func() {
 					if err := recorder.Close(); err != nil {
 						log.Printf("saving recording: %v", err)
 					}
 				}
 			}
+		} else {
+			// When we're not recording, do http header checking.
+			// We can't check universally because option.WithHTTPClient is
+			// incompatible with gRPC options.
+			bqOpts = append(bqOpts, grpcHeadersChecker.CallOptions()...)
+			sOpts = append(sOpts, grpcHeadersChecker.CallOptions()...)
 		}
 		var err error
-		client, err = NewClient(ctx, projID, bqOpt)
+		client, err = NewClient(ctx, projID, bqOpts...)
 		if err != nil {
 			log.Fatalf("NewClient: %v", err)
 		}
-		storageClient, err = storage.NewClient(ctx, sOpt)
+		storageClient, err = storage.NewClient(ctx, sOpts...)
 		if err != nil {
 			log.Fatalf("storage.NewClient: %v", err)
 		}
@@ -388,6 +396,65 @@ func TestIntegration_TableMetadata(t *testing.T) {
 
 }
 
+func TestIntegration_RangePartitioning(t *testing.T) {
+	if client == nil {
+		t.Skip("Integration tests skipped")
+	}
+	ctx := context.Background()
+	table := dataset.Table(tableIDs.New())
+
+	schema := Schema{
+		{Name: "name", Type: StringFieldType},
+		{Name: "somevalue", Type: IntegerFieldType},
+	}
+
+	wantedRange := &RangePartitioningRange{
+		Start:    10,
+		End:      135,
+		Interval: 25,
+	}
+
+	wantedPartitioning := &RangePartitioning{
+		Field: "somevalue",
+		Range: wantedRange,
+	}
+
+	err := table.Create(context.Background(), &TableMetadata{
+		Schema:            schema,
+		RangePartitioning: wantedPartitioning,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Delete(ctx)
+	md, err := table.Metadata(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if md.RangePartitioning == nil {
+		t.Fatal("expected range partitioning, got nil")
+	}
+	got := md.RangePartitioning.Field
+	if wantedPartitioning.Field != got {
+		t.Errorf("RangePartitioning Field: got %v, want %v", got, wantedPartitioning.Field)
+	}
+	if md.RangePartitioning.Range == nil {
+		t.Fatal("expected a range definition, got nil")
+	}
+	gotInt64 := md.RangePartitioning.Range.Start
+	if gotInt64 != wantedRange.Start {
+		t.Errorf("Range.Start: got %v, wanted %v", gotInt64, wantedRange.Start)
+	}
+	gotInt64 = md.RangePartitioning.Range.End
+	if gotInt64 != wantedRange.End {
+		t.Errorf("Range.End: got %v, wanted %v", gotInt64, wantedRange.End)
+	}
+	gotInt64 = md.RangePartitioning.Range.Interval
+	if gotInt64 != wantedRange.Interval {
+		t.Errorf("Range.Interval: got %v, wanted %v", gotInt64, wantedRange.Interval)
+	}
+}
 func TestIntegration_RemoveTimePartitioning(t *testing.T) {
 	if client == nil {
 		t.Skip("Integration tests skipped")
@@ -724,6 +791,50 @@ func TestIntegration_Tables(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIntegration_SimpleRowResults(t *testing.T) {
+	if client == nil {
+		t.Skip("Integration tests skipped")
+	}
+	ctx := context.Background()
+
+	testCases := []struct {
+		description string
+		query       string
+		want        [][]Value
+	}{
+		{
+			description: "literals",
+			query:       "select 17 as foo",
+			want:        [][]Value{{int64(17)}},
+		},
+		{
+			description: "empty results",
+			query:       "SELECT * FROM (select 17 as foo) where false",
+			want:        [][]Value{},
+		},
+		{
+			// Note: currently CTAS returns the rows due to the destination table reference,
+			// but it's not clear that it should.
+			// https://github.com/googleapis/google-cloud-go/issues/1467 for followup.
+			description: "ctas ddl",
+			query:       fmt.Sprintf("CREATE TABLE %s.%s AS SELECT 17 as foo", dataset.DatasetID, tableIDs.New()),
+			want:        [][]Value{{int64(17)}},
+		},
+	}
+	for _, tc := range testCases {
+		curCase := tc
+		t.Run(curCase.description, func(t *testing.T) {
+			t.Parallel()
+			q := client.Query(curCase.query)
+			it, err := q.Read(ctx)
+			if err != nil {
+				t.Fatalf("%s read error: %v", curCase.description, err)
+			}
+			checkReadAndTotalRows(t, curCase.description, it, curCase.want)
+		})
 	}
 }
 
@@ -1617,6 +1728,89 @@ func TestIntegration_QueryDryRun(t *testing.T) {
 	if s.Statistics.Details.(*QueryStatistics).TotalBytesProcessedAccuracy == "" {
 		t.Fatal("no cost accuracy")
 	}
+}
+
+func TestIntegration_Scripting(t *testing.T) {
+	if client == nil {
+		t.Skip("Integration tests skipped")
+	}
+	ctx := context.Background()
+	sql := `
+	-- Declare a variable to hold names as an array.
+	DECLARE top_names ARRAY<STRING>;
+	-- Build an array of the top 100 names from the year 2017.
+	SET top_names = (
+	  SELECT ARRAY_AGG(name ORDER BY number DESC LIMIT 100)
+	  FROM ` + "`bigquery-public-data`" + `.usa_names.usa_1910_current
+	  WHERE year = 2017
+	);
+	-- Which names appear as words in Shakespeare's plays?
+	SELECT
+	  name AS shakespeare_name
+	FROM UNNEST(top_names) AS name
+	WHERE name IN (
+	  SELECT word
+	  FROM ` + "`bigquery-public-data`" + `.samples.shakespeare
+	);
+	`
+	q := client.Query(sql)
+	job, err := q.Run(ctx)
+	if err != nil {
+		t.Fatalf("failed to run parent job: %v", err)
+	}
+	status, err := job.Wait(ctx)
+	if err != nil {
+		t.Fatalf("failed to wait for completion: %v", err)
+	}
+	if status.Err() != nil {
+		t.Fatalf("job terminated with error: %v", err)
+	}
+
+	queryStats, ok := status.Statistics.Details.(*QueryStatistics)
+	if !ok {
+		t.Fatalf("failed to fetch query statistics")
+	}
+
+	want := "SCRIPT"
+	if queryStats.StatementType != want {
+		t.Errorf("statement type mismatch. got %s want %s", queryStats.StatementType, want)
+	}
+
+	if status.Statistics.NumChildJobs <= 0 {
+		t.Errorf("expected script to indicate nonzero child jobs, got %d", status.Statistics.NumChildJobs)
+	}
+
+	// Ensure child jobs are present.
+	var childJobs []*Job
+
+	it := job.Children(ctx)
+	for {
+		job, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		childJobs = append(childJobs, job)
+	}
+	if len(childJobs) == 0 {
+		t.Fatal("Script had no child jobs.")
+	}
+
+	for _, cj := range childJobs {
+		cStatus := cj.LastStatus()
+		if cStatus.Statistics.ParentJobID != job.ID() {
+			t.Errorf("child job %q doesn't indicate parent.  got %q, want %q", cj.ID(), cStatus.Statistics.ParentJobID, job.ID())
+		}
+		if cStatus.Statistics.ScriptStatistics == nil {
+			t.Errorf("child job %q doesn't have script statistics present", cj.ID())
+		}
+		if cStatus.Statistics.ScriptStatistics.EvaluationKind == "" {
+			t.Errorf("child job %q didn't indicate evaluation kind", cj.ID())
+		}
+	}
+
 }
 
 func TestIntegration_ExtractExternal(t *testing.T) {

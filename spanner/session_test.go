@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	vkit "cloud.google.com/go/spanner/apiv1"
-	"cloud.google.com/go/spanner/internal/testutil"
+	. "cloud.google.com/go/spanner/internal/testutil"
+	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -34,29 +34,46 @@ import (
 // TestSessionPoolConfigValidation tests session pool config validation.
 func TestSessionPoolConfigValidation(t *testing.T) {
 	t.Parallel()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	_, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	for _, test := range []struct {
 		spc SessionPoolConfig
 		err error
 	}{
 		{
-			SessionPoolConfig{},
-			errNoRPCGetter(),
-		},
-		{
 			SessionPoolConfig{
-				getRPCClient: func() (*vkit.Client, error) {
-					return client.clients[0], nil
-				},
 				MinOpened: 10,
 				MaxOpened: 5,
 			},
 			errMinOpenedGTMaxOpened(5, 10),
 		},
+		{
+			SessionPoolConfig{
+				WriteSessions: -0.1,
+			},
+			errWriteFractionOutOfRange(-0.1),
+		},
+		{
+			SessionPoolConfig{
+				WriteSessions: 2.0,
+			},
+			errWriteFractionOutOfRange(2.0),
+		},
+		{
+			SessionPoolConfig{
+				HealthCheckWorkers: -1,
+			},
+			errHealthCheckWorkersNegative(-1),
+		},
+		{
+			SessionPoolConfig{
+				HealthCheckInterval: -time.Second,
+			},
+			errHealthCheckIntervalNegative(-time.Second),
+		},
 	} {
-		if _, err := newSessionPool("mockdb", test.spc, nil); !testEqual(err, test.err) {
+		if _, err := newSessionPool(client.sc, test.spc); !testEqual(err, test.err) {
 			t.Fatalf("want %v, got %v", test.err, err)
 		}
 	}
@@ -66,8 +83,8 @@ func TestSessionPoolConfigValidation(t *testing.T) {
 func TestSessionCreation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Take three sessions from session pool, this should trigger session pool
@@ -86,7 +103,7 @@ func TestSessionCreation(t *testing.T) {
 	if len(gotDs) != len(shs) {
 		t.Fatalf("session pool created %v sessions, want %v", len(gotDs), len(shs))
 	}
-	if wantDs := server.testSpanner.DumpSessions(); !testEqual(gotDs, wantDs) {
+	if wantDs := server.TestSpanner.DumpSessions(); !testEqual(gotDs, wantDs) {
 		t.Fatalf("session pool creates sessions %v, want %v", gotDs, wantDs)
 	}
 	// Verify that created sessions are recorded correctly in session pool.
@@ -118,11 +135,11 @@ func TestTakeFromIdleList(t *testing.T) {
 	ctx := context.Background()
 
 	// Make sure maintainer keeps the idle sessions.
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{MaxIdle: 10},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Take ten sessions from session pool and recycle them.
@@ -142,7 +159,7 @@ func TestTakeFromIdleList(t *testing.T) {
 	}
 	// Further session requests from session pool won't cause mockclient to
 	// create more sessions.
-	wantSessions := server.testSpanner.DumpSessions()
+	wantSessions := server.TestSpanner.DumpSessions()
 	// Take ten sessions from session pool again, this time all sessions should
 	// come from idle list.
 	gotSessions := map[string]bool{}
@@ -168,11 +185,11 @@ func TestTakeWriteSessionFromIdleList(t *testing.T) {
 	ctx := context.Background()
 
 	// Make sure maintainer keeps the idle sessions.
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{MaxIdle: 20},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Take ten sessions from session pool and recycle them.
@@ -192,7 +209,7 @@ func TestTakeWriteSessionFromIdleList(t *testing.T) {
 	}
 	// Further session requests from session pool won't cause mockclient to
 	// create more sessions.
-	wantSessions := server.testSpanner.DumpSessions()
+	wantSessions := server.TestSpanner.DumpSessions()
 	// Take ten sessions from session pool again, this time all sessions should
 	// come from idle list.
 	gotSessions := map[string]bool{}
@@ -218,7 +235,7 @@ func TestTakeFromIdleListChecked(t *testing.T) {
 	ctx := context.Background()
 
 	// Make sure maintainer keeps the idle sessions.
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
 				MaxIdle:                   1,
@@ -226,7 +243,7 @@ func TestTakeFromIdleListChecked(t *testing.T) {
 				healthCheckSampleInterval: 10 * time.Millisecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Stop healthcheck workers to simulate slow pings.
@@ -238,17 +255,13 @@ func TestTakeFromIdleListChecked(t *testing.T) {
 		t.Fatalf("failed to get session: %v", err)
 	}
 
-	// Make sure it's sampled once before recycling, otherwise it will be
-	// cleaned up.
-	<-time.After(sp.SessionPoolConfig.healthCheckSampleInterval)
+	// Force ping during the first take() by setting check time to the past.
+	sh.session.nextCheck = time.Now().Add(-time.Minute)
 	wantSid := sh.getID()
 	sh.recycle()
 
-	// TODO(deklerk): get rid of this
-	<-time.After(time.Second)
-
 	// Two back-to-back session requests, both of them should return the same
-	// session created before and none of them should trigger a session ping.
+	// session created before, but only the first of them should trigger a session ping.
 	for i := 0; i < 2; i++ {
 		// Take the session from the idle list and recycle it.
 		sh, err = sp.take(ctx)
@@ -260,9 +273,8 @@ func TestTakeFromIdleListChecked(t *testing.T) {
 		}
 
 		// The two back-to-back session requests shouldn't trigger any session
-		// pings because sessionPool.Take
-		// reschedules the next healthcheck.
-		if got, want := server.testSpanner.DumpPings(), ([]string{wantSid}); !testEqual(got, want) {
+		// pings because sessionPool.Take reschedules the next healthcheck.
+		if got, want := server.TestSpanner.DumpPings(), ([]string{wantSid}); !testEqual(got, want) {
 			t.Fatalf("%v - got ping session requests: %v, want %v", i, got, want)
 		}
 		sh.recycle()
@@ -271,14 +283,14 @@ func TestTakeFromIdleListChecked(t *testing.T) {
 	// Inject session error to server stub, and take the session from the
 	// session pool, the old session should be destroyed and the session pool
 	// will create a new session.
-	server.testSpanner.PutExecutionTime(testutil.MethodGetSession,
-		testutil.SimulatedExecutionTime{
+	server.TestSpanner.PutExecutionTime(MethodGetSession,
+		SimulatedExecutionTime{
 			Errors: []error{status.Errorf(codes.NotFound, "Session not found")},
 		})
 
-	// Delay to trigger sessionPool.Take to ping the session.
-	// TODO(deklerk): get rid of this
-	<-time.After(time.Second)
+	// Force ping by setting check time in the past.
+	s := sp.idleList.Front().Value.(*session)
+	s.nextCheck = time.Now().Add(-time.Minute)
 
 	// take will take the idle session. Then it will send a GetSession request
 	// to check if it's healthy. It'll discover that it's not healthy
@@ -287,7 +299,7 @@ func TestTakeFromIdleListChecked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get session: %v", err)
 	}
-	ds := server.testSpanner.DumpSessions()
+	ds := server.TestSpanner.DumpSessions()
 	if len(ds) != 1 {
 		t.Fatalf("dumped sessions from mockclient: %v, want %v", ds, sh.getID())
 	}
@@ -303,7 +315,7 @@ func TestTakeFromIdleWriteListChecked(t *testing.T) {
 	ctx := context.Background()
 
 	// Make sure maintainer keeps the idle sessions.
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
 				MaxIdle:                   1,
@@ -311,7 +323,7 @@ func TestTakeFromIdleWriteListChecked(t *testing.T) {
 				healthCheckSampleInterval: 10 * time.Millisecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Stop healthcheck workers to simulate slow pings.
@@ -323,17 +335,14 @@ func TestTakeFromIdleWriteListChecked(t *testing.T) {
 		t.Fatalf("failed to get session: %v", err)
 	}
 	wantSid := sh.getID()
-
-	// Make sure it's sampled once before recycling, otherwise it will be
-	// cleaned up.
-	<-time.After(sp.SessionPoolConfig.healthCheckSampleInterval)
+	// Set the next check in the past to ensure the next take() call will
+	// trigger a health check.
+	sh.session.nextCheck = time.Now().Add(-time.Minute)
 	sh.recycle()
 
-	// TODO(deklerk): get rid of this
-	<-time.After(time.Second)
-
 	// Two back-to-back session requests, both of them should return the same
-	// session created before and none of them should trigger a session ping.
+	// session created before and only the first of them should trigger a
+	// session ping.
 	for i := 0; i < 2; i++ {
 		// Take the session from the idle list and recycle it.
 		sh, err = sp.takeWriteSession(ctx)
@@ -345,7 +354,7 @@ func TestTakeFromIdleWriteListChecked(t *testing.T) {
 		}
 		// The two back-to-back session requests shouldn't trigger any session
 		// pings because sessionPool.Take reschedules the next healthcheck.
-		if got, want := server.testSpanner.DumpPings(), ([]string{wantSid}); !testEqual(got, want) {
+		if got, want := server.TestSpanner.DumpPings(), ([]string{wantSid}); !testEqual(got, want) {
 			t.Fatalf("%v - got ping session requests: %v, want %v", i, got, want)
 		}
 		sh.recycle()
@@ -354,20 +363,20 @@ func TestTakeFromIdleWriteListChecked(t *testing.T) {
 	// Inject session error to mockclient, and take the session from the
 	// session pool, the old session should be destroyed and the session pool
 	// will create a new session.
-	server.testSpanner.PutExecutionTime(testutil.MethodGetSession,
-		testutil.SimulatedExecutionTime{
+	server.TestSpanner.PutExecutionTime(MethodGetSession,
+		SimulatedExecutionTime{
 			Errors: []error{status.Errorf(codes.NotFound, "Session not found")},
 		})
 
-	// Delay to trigger sessionPool.Take to ping the session.
-	// TOOD(deklerk) get rid of this
-	<-time.After(time.Second)
+	// Force ping by setting check time in the past.
+	s := sp.idleList.Front().Value.(*session)
+	s.nextCheck = time.Now().Add(-time.Minute)
 
 	sh, err = sp.takeWriteSession(ctx)
 	if err != nil {
 		t.Fatalf("failed to get session: %v", err)
 	}
-	ds := server.testSpanner.DumpSessions()
+	ds := server.TestSpanner.DumpSessions()
 	if len(ds) != 1 {
 		t.Fatalf("dumped sessions from mockclient: %v, want %v", ds, sh.getID())
 	}
@@ -380,13 +389,13 @@ func TestTakeFromIdleWriteListChecked(t *testing.T) {
 func TestMaxOpenedSessions(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	_, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
 				MaxOpened: 1,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	sh1, err := sp.take(ctx)
@@ -395,24 +404,30 @@ func TestMaxOpenedSessions(t *testing.T) {
 	}
 
 	// Session request will timeout due to the max open sessions constraint.
-	ctx2, cancel := context.WithTimeout(ctx, time.Second)
+	ctx2, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancel()
 	_, gotErr := sp.take(ctx2)
 	if wantErr := errGetSessionTimeout(); !testEqual(gotErr, wantErr) {
 		t.Fatalf("the second session retrival returns error %v, want %v", gotErr, wantErr)
 	}
-
+	doneWaiting := make(chan struct{})
 	go func() {
-		// TODO(deklerk): remove this
-		<-time.After(time.Second)
 		// Destroy the first session to allow the next session request to
 		// proceed.
+		<-doneWaiting
 		sh1.destroy()
 	}()
 
+	go func() {
+		// Wait a short random time before destroying the session handle.
+		<-time.After(10 * time.Millisecond)
+		close(doneWaiting)
+	}()
 	// Now session request can be processed because the first session will be
 	// destroyed.
-	sh2, err := sp.take(ctx)
+	ctx3, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	sh2, err := sp.take(ctx3)
 	if err != nil {
 		t.Fatalf("after the first session is destroyed, session retrival still returns error %v, want nil", err)
 	}
@@ -425,13 +440,14 @@ func TestMaxOpenedSessions(t *testing.T) {
 func TestMinOpenedSessions(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	_, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
-				MinOpened: 1,
+				MinOpened:                 1,
+				healthCheckSampleInterval: time.Millisecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Take ten sessions from session pool and recycle them.
@@ -455,12 +471,30 @@ func TestMinOpenedSessions(t *testing.T) {
 		s.destroy(true)
 	}
 
+	// Wait until the maintainer has had a chance to replenish the pool.
+	for i := 0; i < 10; i++ {
+		sp.mu.Lock()
+		if sp.numOpened > 0 {
+			sp.mu.Unlock()
+			break
+		}
+		sp.mu.Unlock()
+		<-time.After(sp.healthCheckSampleInterval)
+	}
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
-	// There should be still one session left in idle list due to the min open
-	// sessions constraint.
-	if sp.idleList.Len() != 1 {
-		t.Fatalf("got %v sessions in idle list, want 1 %d", sp.idleList.Len(), sp.numOpened)
+	// There should be still one session left in either the idle list or in one
+	// of the other opened states due to the min open sessions constraint.
+	if (sp.idleList.Len() +
+		sp.idleWriteList.Len() +
+		int(sp.prepareReqs) +
+		int(sp.createReqs)) != 1 {
+		t.Fatalf(
+			"got %v sessions in idle lists, want 1. Opened: %d, read: %d, "+
+				"write: %d, in preparation: %d, in creation: %d",
+			sp.idleList.Len()+sp.idleWriteList.Len(), sp.numOpened,
+			sp.idleList.Len(), sp.idleWriteList.Len(), sp.prepareReqs,
+			sp.createReqs)
 	}
 }
 
@@ -468,18 +502,18 @@ func TestMinOpenedSessions(t *testing.T) {
 func TestMaxBurst(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
 				MaxBurst: 1,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Will cause session creation RPC to be retried forever.
-	server.testSpanner.PutExecutionTime(testutil.MethodCreateSession,
-		testutil.SimulatedExecutionTime{
+	server.TestSpanner.PutExecutionTime(MethodCreateSession,
+		SimulatedExecutionTime{
 			Errors:    []error{status.Errorf(codes.Unavailable, "try later")},
 			KeepError: true,
 		})
@@ -511,10 +545,10 @@ func TestMaxBurst(t *testing.T) {
 	}
 
 	// Let the first session request succeed.
-	server.testSpanner.Freeze()
-	server.testSpanner.PutExecutionTime(testutil.MethodCreateSession, testutil.SimulatedExecutionTime{})
+	server.TestSpanner.Freeze()
+	server.TestSpanner.PutExecutionTime(MethodCreateSession, SimulatedExecutionTime{})
 	//close(allowRequests)
-	server.testSpanner.Unfreeze()
+	server.TestSpanner.Unfreeze()
 
 	// Now new session request can proceed because the first session request will eventually succeed.
 	sh, err := sp.take(ctx)
@@ -530,14 +564,17 @@ func TestMaxBurst(t *testing.T) {
 func TestSessionRecycle(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	// Set MaxBurst=MinOpened to prevent additional sessions to be created
+	// while session pool initialization is still running.
+	_, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
 				MinOpened: 1,
 				MaxIdle:   5,
+				MaxBurst:  1,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Test session is correctly recycled and reused.
@@ -551,33 +588,34 @@ func TestSessionRecycle(t *testing.T) {
 
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
-	// Ideally it should only be 1, because the session should be recycled and
-	// re-used each time. However, sometimes the pool maintainer might increase
-	// the pool size by 1 right around the time we take (which also increases
-	// the pool size by 1), so this assertion is OK with either 1 or 2. We
-	// expect never to see more than 2, though, even when MaxIdle is quite high:
-	// each session should be recycled and re-used.
-	if sp.numOpened != 1 && sp.numOpened != 2 {
-		t.Fatalf("Expect session pool size 1 or 2, got %d", sp.numOpened)
+	// The session pool should only contain 1 session, as there is no minimum
+	// configured. In addition, there has never been more than one session in
+	// use at any time, so there's no need for the session pool to create a
+	// second session. The session has also been in use all the time, so there
+	// also no reason for the session pool to delete the session.
+	if sp.numOpened != 1 {
+		t.Fatalf("Expect session pool size 1, got %d", sp.numOpened)
 	}
 }
 
-// TODO(deklerk): Investigate why s.destroy(true) is flakey.
 // TestSessionDestroy tests destroying sessions.
 func TestSessionDestroy(t *testing.T) {
-	t.Skip("s.destroy(true) is flakey")
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	_, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
 				MinOpened: 1,
+				MaxBurst:  1,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
-	<-time.After(10 * time.Millisecond) // maintainer will create one session, we wait for it create session to avoid flakiness in test
+	// Creating a session pool with MinSessions=1 will automatically start the
+	// creation of 1 session when the session pool is created. As MaxBurst=1,
+	// the session pool will never create more than 1 session at a time, so the
+	// take() method will wait if the initial session has not yet been created.
 	sh, err := sp.take(ctx)
 	if err != nil {
 		t.Fatalf("cannot get session from session pool: %v", err)
@@ -631,14 +669,14 @@ func TestHcHeap(t *testing.T) {
 func TestHealthCheckScheduler(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
 				HealthCheckInterval:       50 * time.Millisecond,
 				healthCheckSampleInterval: 10 * time.Millisecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Create 50 sessions.
@@ -652,13 +690,13 @@ func TestHealthCheckScheduler(t *testing.T) {
 	// Make sure we start with a ping history to avoid that the first
 	// sessions that were created have not already exceeded the maximum
 	// number of pings.
-	server.testSpanner.ClearPings()
+	server.TestSpanner.ClearPings()
 	// Wait for 10-30 pings per session.
 	waitFor(t, func() error {
 		// Only check actually live sessions and ignore any sessions the
 		// session pool may have deleted in the meantime.
-		liveSessions := server.testSpanner.DumpSessions()
-		dp := server.testSpanner.DumpPings()
+		liveSessions := server.TestSpanner.DumpSessions()
+		dp := server.TestSpanner.DumpPings()
 		gotPings := map[string]int64{}
 		for _, p := range dp {
 			gotPings[p]++
@@ -678,14 +716,15 @@ func TestHealthCheckScheduler(t *testing.T) {
 func TestWriteSessionsPrepared(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	_, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
-				WriteSessions: 0.5,
-				MaxIdle:       20,
+				WriteSessions:       0.5,
+				MaxIdle:             20,
+				HealthCheckInterval: time.Nanosecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	shs := make([]*sessionHandle, 10)
@@ -701,9 +740,9 @@ func TestWriteSessionsPrepared(t *testing.T) {
 		sh.recycle()
 	}
 
-	// Sleep for 1s, allowing healthcheck workers to invoke begin transaction.
-	// TODO(deklerk): get rid of this
-	<-time.After(time.Second)
+	// Take 5 write sessions. The write sessions will be taken from either the
+	// list of prepared sessions (idleWriteList), or they will be prepared
+	// during the takeWriteSession method.
 	wshs := make([]*sessionHandle, 5)
 	for i := 0; i < 5; i++ {
 		wshs[i], err = sp.takeWriteSession(ctx)
@@ -714,12 +753,10 @@ func TestWriteSessionsPrepared(t *testing.T) {
 			t.Fatalf("got nil transaction id from session pool")
 		}
 	}
+	// Return the session to the pool.
 	for _, sh := range wshs {
 		sh.recycle()
 	}
-
-	// TODO(deklerk): get rid of this
-	<-time.After(time.Second)
 
 	// Now force creation of 10 more sessions.
 	shs = make([]*sessionHandle, 20)
@@ -734,10 +771,23 @@ func TestWriteSessionsPrepared(t *testing.T) {
 	for _, sh := range shs {
 		sh.recycle()
 	}
+	// The health checker should eventually prepare 10 of the 20 sessions with
+	// a r/w tx.
+	waitUntil := time.After(time.Second)
+	var numWritePrepared int
+	for numWritePrepared < 10 {
+		select {
+		case <-waitUntil:
+			break
+		default:
+		}
+		sp.mu.Lock()
+		numWritePrepared = sp.idleWriteList.Len()
+		sp.mu.Unlock()
+	}
 
-	// TODO(deklerk): get rid of this
-	<-time.After(time.Second)
-
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
 	if sp.idleWriteList.Len() != 10 {
 		t.Fatalf("Expect 10 write prepared session, got: %d", sp.idleWriteList.Len())
 	}
@@ -748,15 +798,16 @@ func TestWriteSessionsPrepared(t *testing.T) {
 func TestTakeFromWriteQueue(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	_, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
-				MaxOpened:     1,
-				WriteSessions: 1.0,
-				MaxIdle:       1,
+				MaxOpened:           1,
+				WriteSessions:       1.0,
+				MaxIdle:             1,
+				HealthCheckInterval: time.Nanosecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	sh, err := sp.take(ctx)
@@ -765,16 +816,29 @@ func TestTakeFromWriteQueue(t *testing.T) {
 	}
 	sh.recycle()
 
-	// TODO(deklerk): get rid of this
-	<-time.After(time.Second)
+	// Wait until the health checker has write-prepared the session.
+	waitUntil := time.After(time.Second)
+	var numWritePrepared int
+	for numWritePrepared == 0 {
+		select {
+		case <-waitUntil:
+			break
+		default:
+		}
+		sp.mu.Lock()
+		numWritePrepared = sp.idleWriteList.Len()
+		sp.mu.Unlock()
+	}
 
 	// The session should now be in write queue but take should also return it.
+	sp.mu.Lock()
 	if sp.idleWriteList.Len() == 0 {
 		t.Fatalf("write queue unexpectedly empty")
 	}
 	if sp.idleList.Len() != 0 {
 		t.Fatalf("read queue not empty")
 	}
+	sp.mu.Unlock()
 	sh, err = sp.take(ctx)
 	if err != nil {
 		t.Fatalf("cannot get session from session pool: %v", err)
@@ -786,14 +850,14 @@ func TestTakeFromWriteQueue(t *testing.T) {
 func TestSessionHealthCheck(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
-				HealthCheckInterval:       50 * time.Millisecond,
+				HealthCheckInterval:       time.Nanosecond,
 				healthCheckSampleInterval: 10 * time.Millisecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
 	// Test pinging sessions.
@@ -804,7 +868,7 @@ func TestSessionHealthCheck(t *testing.T) {
 
 	// Wait for healthchecker to send pings to session.
 	waitFor(t, func() error {
-		pings := server.testSpanner.DumpPings()
+		pings := server.TestSpanner.DumpPings()
 		if len(pings) == 0 || pings[0] != sh.getID() {
 			return fmt.Errorf("healthchecker didn't send any ping to session %v", sh.getID())
 		}
@@ -816,27 +880,25 @@ func TestSessionHealthCheck(t *testing.T) {
 		t.Fatalf("cannot get session from session pool: %v", err)
 	}
 
-	server.testSpanner.Freeze()
-	server.testSpanner.PutExecutionTime(testutil.MethodGetSession,
-		testutil.SimulatedExecutionTime{
+	server.TestSpanner.Freeze()
+	server.TestSpanner.PutExecutionTime(MethodGetSession,
+		SimulatedExecutionTime{
 			Errors:    []error{status.Errorf(codes.NotFound, "Session not found")},
 			KeepError: true,
 		})
-	server.testSpanner.Unfreeze()
-	//atomic.SwapInt64(&requestShouldErr, 1)
-
-	// Wait for healthcheck workers to find the broken session and tear it down.
-	// TODO(deklerk): get rid of this
-	<-time.After(1 * time.Second)
+	server.TestSpanner.Unfreeze()
 
 	s := sh.session
-	if sh.session.isValid() {
-		t.Fatalf("session(%v) is still alive, want it to be dropped by healthcheck workers", s)
-	}
+	waitFor(t, func() error {
+		if sh.session.isValid() {
+			return fmt.Errorf("session(%v) is still alive, want it to be dropped by healthcheck workers", s)
+		}
+		return nil
+	})
 
-	server.testSpanner.Freeze()
-	server.testSpanner.PutExecutionTime(testutil.MethodGetSession, testutil.SimulatedExecutionTime{})
-	server.testSpanner.Unfreeze()
+	server.TestSpanner.Freeze()
+	server.TestSpanner.PutExecutionTime(MethodGetSession, SimulatedExecutionTime{})
+	server.TestSpanner.Unfreeze()
 
 	// Test garbage collection.
 	sh, err = sp.take(ctx)
@@ -876,10 +938,9 @@ func TestStressSessionPool(t *testing.T) {
 		cfg.healthCheckSampleInterval = 10 * time.Millisecond
 		cfg.HealthCheckWorkers = 50
 
-		server, client := newSpannerInMemTestServerWithConfig(t,
-			ClientConfig{
-				SessionPoolConfig: cfg,
-			})
+		server, client, teardown := setupMockedTestServerWithConfig(t, ClientConfig{
+			SessionPoolConfig: cfg,
+		})
 		sp := client.idleSessions
 
 		// Create a test group for this configuration and schedule 100 sub
@@ -887,10 +948,8 @@ func TestStressSessionPool(t *testing.T) {
 		t.Run(fmt.Sprintf("TestStressSessionPoolGroup%v", ti), func(t *testing.T) {
 			for i := 0; i < 100; i++ {
 				idx := i
-				t.Run(fmt.Sprintf("TestStressSessionPoolWithCfg%dWorker%03d", ti, idx),
-					func(t *testing.T) {
-						testStressSessionPool(t, cfg, ti, idx, sp, client)
-					})
+				t.Logf("TestStressSessionPoolWithCfg%dWorker%03d", ti, idx)
+				testStressSessionPool(t, cfg, ti, idx, sp, client)
 			}
 		})
 		sp.hc.close()
@@ -898,7 +957,7 @@ func TestStressSessionPool(t *testing.T) {
 		// stable.
 		idleSessions := map[string]bool{}
 		hcSessions := map[string]bool{}
-		mockSessions := server.testSpanner.DumpSessions()
+		mockSessions := server.TestSpanner.DumpSessions()
 		// Dump session pool's idle list.
 		for sl := sp.idleList.Front(); sl != nil; sl = sl.Next() {
 			s := sl.Value.(*session)
@@ -944,18 +1003,17 @@ func TestStressSessionPool(t *testing.T) {
 			}
 		}
 		sp.close()
-		mockSessions = server.testSpanner.DumpSessions()
+		mockSessions = server.TestSpanner.DumpSessions()
 		for id, b := range hcSessions {
 			if b && mockSessions[id] {
 				t.Fatalf("Found session from pool still live on server: %v", id)
 			}
 		}
-		server.teardown(client)
+		teardown()
 	}
 }
 
 func testStressSessionPool(t *testing.T, cfg SessionPoolConfig, ti int, idx int, pool *sessionPool, client *Client) {
-	t.Parallel()
 	ctx := context.Background()
 	// Test worker iterates 1K times and tries different
 	// session / session pool operations.
@@ -1016,10 +1074,6 @@ func testStressSessionPool(t *testing.T, cfg SessionPoolConfig, ti int, idx int,
 	}
 }
 
-// TODO(deklerk): Investigate why this test is flakey, even with waitFor. Example
-// flakey failure: session_test.go:946: after 15s waiting, got Scale down.
-// Expect 5 open, got 6
-//
 // TestMaintainer checks the session pool maintainer maintains the number of
 // sessions in the following cases:
 //
@@ -1028,23 +1082,21 @@ func testStressSessionPool(t *testing.T, cfg SessionPoolConfig, ti int, idx int,
 // 2. On increased session usage, provision extra MaxIdle sessions.
 // 3. After the surge passes, scale down the session pool accordingly.
 func TestMaintainer(t *testing.T) {
-	t.Skip("asserting session state seems flakey")
 	t.Parallel()
 	ctx := context.Background()
 
 	minOpened := uint64(5)
 	maxIdle := uint64(4)
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	_, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: SessionPoolConfig{
-				MinOpened: minOpened,
-				MaxIdle:   maxIdle,
+				MinOpened:                 minOpened,
+				MaxIdle:                   maxIdle,
+				healthCheckSampleInterval: time.Millisecond,
 			},
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
-
-	sampleInterval := sp.SessionPoolConfig.healthCheckSampleInterval
 
 	waitFor(t, func() error {
 		sp.mu.Lock()
@@ -1058,7 +1110,7 @@ func TestMaintainer(t *testing.T) {
 	// To save test time, we are not creating many sessions, because the time
 	// to create sessions will have impact on the decision on sessionsToKeep.
 	// We also parallelize the take and recycle process.
-	shs := make([]*sessionHandle, 10)
+	shs := make([]*sessionHandle, 20)
 	for i := 0; i < len(shs); i++ {
 		var err error
 		shs[i], err = sp.take(ctx)
@@ -1067,39 +1119,42 @@ func TestMaintainer(t *testing.T) {
 		}
 	}
 	sp.mu.Lock()
-	if sp.numOpened != 10 {
-		t.Fatalf("Scale out from normal use. Expect %d open, got %d", 10, sp.numOpened)
+	if sp.numOpened != 20 {
+		t.Fatalf("Scale out from normal use. Expect %d open, got %d", 20, sp.numOpened)
 	}
 	sp.mu.Unlock()
 
-	<-time.After(sampleInterval)
-	for _, sh := range shs[:7] {
+	// Return 14 sessions to the pool. There are still 6 sessions checked out.
+	for _, sh := range shs[:14] {
 		sh.recycle()
 	}
 
+	// The pool should scale down to sessionsInUse + MaxIdle = 6 + 4 = 10.
 	waitFor(t, func() error {
 		sp.mu.Lock()
 		defer sp.mu.Unlock()
-		if sp.numOpened != 7 {
-			return fmt.Errorf("Keep extra MaxIdle sessions. Expect %d open, got %d", 7, sp.numOpened)
+		if sp.numOpened != 10 {
+			return fmt.Errorf("Keep extra MaxIdle sessions. Expect %d open, got %d", 10, sp.numOpened)
 		}
 		return nil
 	})
 
-	for _, sh := range shs[7:] {
+	// Return the remaining 6 sessions.
+	// The pool should now scale down to minOpened + maxIdle.
+	for _, sh := range shs[14:] {
 		sh.recycle()
 	}
 	waitFor(t, func() error {
 		sp.mu.Lock()
 		defer sp.mu.Unlock()
 		if sp.numOpened != minOpened {
-			return fmt.Errorf("Scale down. Expect %d open, got %d", minOpened, sp.numOpened)
+			return fmt.Errorf("Scale down. Expect %d open, got %d", minOpened+maxIdle, sp.numOpened)
 		}
 		return nil
 	})
 }
 
-// Tests that maintainer creates up to MinOpened connections.
+// Tests that the session pool creates up to MinOpened connections.
 //
 // Historical context: This test also checks that a low
 // healthCheckSampleInterval does not prevent it from opening connections.
@@ -1107,33 +1162,80 @@ func TestMaintainer(t *testing.T) {
 // creations to time out. That should not be considered a problem, but it
 // could cause the test case to fail if it happens too often.
 // See: https://github.com/googleapis/google-cloud-go/issues/1259
-func TestMaintainer_CreatesSessions(t *testing.T) {
+func TestInit_CreatesSessions(t *testing.T) {
 	t.Parallel()
 	spc := SessionPoolConfig{
 		MinOpened:                 10,
 		MaxIdle:                   10,
+		WriteSessions:             0.0,
 		healthCheckSampleInterval: 20 * time.Millisecond,
 	}
-	server, client := newSpannerInMemTestServerWithConfig(t,
+	server, client, teardown := setupMockedTestServerWithConfig(t,
 		ClientConfig{
 			SessionPoolConfig: spc,
+			NumChannels:       4,
 		})
-	defer server.teardown(client)
+	defer teardown()
 	sp := client.idleSessions
 
-	timeoutAmt := 4 * time.Second
-	timeout := time.After(timeoutAmt)
-	var numOpened uint64
+	timeout := time.After(4 * time.Second)
+	var numOpened int
 loop:
 	for {
 		select {
 		case <-timeout:
-			t.Fatalf("timed out after %v, got %d session(s), want %d", timeoutAmt, numOpened, spc.MinOpened)
+			t.Fatalf("timed out, got %d session(s), want %d", numOpened, spc.MinOpened)
 		default:
 			sp.mu.Lock()
-			numOpened = sp.numOpened
+			numOpened = sp.idleList.Len() + sp.idleWriteList.Len()
 			sp.mu.Unlock()
 			if numOpened == 10 {
+				break loop
+			}
+		}
+	}
+	_, err := shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.BatchCreateSessionsRequest{},
+		&sppb.BatchCreateSessionsRequest{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Tests that the session pool with a MinSessions>0 also prepares WriteSessions
+// sessions.
+func TestInit_PreparesSessions(t *testing.T) {
+	t.Parallel()
+	spc := SessionPoolConfig{
+		MinOpened:                 10,
+		MaxIdle:                   10,
+		WriteSessions:             0.5,
+		healthCheckSampleInterval: 20 * time.Millisecond,
+	}
+	_, client, teardown := setupMockedTestServerWithConfig(t,
+		ClientConfig{
+			SessionPoolConfig: spc,
+		})
+	defer teardown()
+	sp := client.idleSessions
+
+	timeoutAmt := 4 * time.Second
+	timeout := time.After(timeoutAmt)
+	var numPrepared int
+	want := int(spc.WriteSessions * float64(spc.MinOpened))
+loop:
+	for {
+		select {
+		case <-timeout:
+			t.Fatalf("timed out after %v, got %d write-prepared session(s), want %d", timeoutAmt, numPrepared, want)
+		default:
+			sp.mu.Lock()
+			numPrepared = sp.idleWriteList.Len()
+			sp.mu.Unlock()
+			if numPrepared == want {
 				break loop
 			}
 		}
@@ -1176,5 +1278,152 @@ func waitFor(t *testing.T, assert func() error) {
 		}
 
 		return
+	}
+}
+
+// Tests that maintainer only deletes sessions after a full maintenance window
+// of 10 cycles has finished.
+func TestMaintainer_DeletesSessions(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const sampleInterval = time.Millisecond * 10
+	_, client, teardown := setupMockedTestServerWithConfig(t,
+		ClientConfig{
+			SessionPoolConfig: SessionPoolConfig{healthCheckSampleInterval: sampleInterval},
+		})
+	defer teardown()
+	sp := client.idleSessions
+
+	// Take two sessions from the pool.
+	// This will cause max sessions in use to be 2 during this window.
+	sh1 := takeSession(ctx, t, sp)
+	sh2 := takeSession(ctx, t, sp)
+	wantSessions := map[string]bool{}
+	wantSessions[sh1.getID()] = true
+	wantSessions[sh2.getID()] = true
+	// Return the sessions to the pool and then assure that they
+	// are not deleted while still within the maintenance window.
+	sh1.recycle()
+	sh2.recycle()
+	// Wait for 20 milliseconds, i.e. approx 2 iterations of the
+	// maintainer. The sessions should still be in the pool.
+	<-time.After(sampleInterval * 2)
+	sh3 := takeSession(ctx, t, sp)
+	sh4 := takeSession(ctx, t, sp)
+	// Check that the returned sessions are equal to the sessions that we got
+	// the first time from the session pool.
+	gotSessions := map[string]bool{}
+	gotSessions[sh3.getID()] = true
+	gotSessions[sh4.getID()] = true
+	testEqual(wantSessions, gotSessions)
+	// Return the sessions to the pool.
+	sh3.recycle()
+	sh4.recycle()
+
+	// Now wait for the maintenance window to finish. This will cause the
+	// maintainer to enter a new window and reset the max number of sessions in
+	// use to the currently number of checked out sessions. That is 0, as all
+	// sessions have been returned to the pool. That again will cause the
+	// maintainer to delete these sessions at the next iteration, unless we
+	// checkout new sessions during the first iteration.
+	waitFor(t, func() error {
+		sp.mu.Lock()
+		defer sp.mu.Unlock()
+		if sp.numOpened > 0 {
+			return fmt.Errorf("session pool still contains more than 0 sessions")
+		}
+		return nil
+	})
+	sh5 := takeSession(ctx, t, sp)
+	sh6 := takeSession(ctx, t, sp)
+	// Assure that these sessions are new sessions.
+	if gotSessions[sh5.getID()] || gotSessions[sh6.getID()] {
+		t.Fatal("got unexpected existing session from pool")
+	}
+}
+
+func takeSession(ctx context.Context, t *testing.T, sp *sessionPool) *sessionHandle {
+	sh, err := sp.take(ctx)
+	if err != nil {
+		t.Fatalf("cannot get session from session pool: %v", err)
+	}
+	return sh
+}
+
+func TestMaintenanceWindow_CycleAndUpdateMaxCheckedOut(t *testing.T) {
+	t.Parallel()
+
+	maxOpened := uint64(1000)
+	mw := newMaintenanceWindow(maxOpened)
+	for _, m := range mw.maxSessionsCheckedOut {
+		if m < maxOpened {
+			t.Fatalf("Max sessions checked out mismatch.\nGot: %v\nWant: %v", m, maxOpened)
+		}
+	}
+	// Do one cycle and simulate that there are currently no sessions checked
+	// out of the pool.
+	mw.startNewCycle(0)
+	if g, w := mw.maxSessionsCheckedOut[0], uint64(0); g != w {
+		t.Fatalf("Max sessions checked out mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	for _, m := range mw.maxSessionsCheckedOut[1:] {
+		if m < maxOpened {
+			t.Fatalf("Max sessions checked out mismatch.\nGot: %v\nWant: %v", m, maxOpened)
+		}
+	}
+	// Check that the max checked out during the entire window is still
+	// maxOpened.
+	if g, w := mw.maxSessionsCheckedOutDuringWindow(), maxOpened; g != w {
+		t.Fatalf("Max sessions checked out during window mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	// Update the max number checked out for the current cycle.
+	mw.updateMaxSessionsCheckedOutDuringWindow(uint64(10))
+	if g, w := mw.maxSessionsCheckedOut[0], uint64(10); g != w {
+		t.Fatalf("Max sessions checked out mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	// The max of the entire window should still not change.
+	if g, w := mw.maxSessionsCheckedOutDuringWindow(), maxOpened; g != w {
+		t.Fatalf("Max sessions checked out during window mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	// Now pass enough cycles to complete a maintenance window. Each cycle has
+	// no sessions checked out. We start at 1, as we have already passed one
+	// cycle. This should then be the last cycle still in the maintenance
+	// window, and the only one with a maxSessionsCheckedOut greater than 0.
+	for i := 1; i < maintenanceWindowSize; i++ {
+		mw.startNewCycle(0)
+	}
+	for _, m := range mw.maxSessionsCheckedOut[:9] {
+		if m != 0 {
+			t.Fatalf("Max sessions checked out mismatch.\nGot: %v\nWant: %v", m, 0)
+		}
+	}
+	// The oldest cycle in the window should have max=10.
+	if g, w := mw.maxSessionsCheckedOut[maintenanceWindowSize-1], uint64(10); g != w {
+		t.Fatalf("Max sessions checked out mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	// The max of the entire window should now be 10.
+	if g, w := mw.maxSessionsCheckedOutDuringWindow(), uint64(10); g != w {
+		t.Fatalf("Max sessions checked out during window mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	// Do another cycle with max=0.
+	mw.startNewCycle(0)
+	// The max of the entire window should now be 0.
+	if g, w := mw.maxSessionsCheckedOutDuringWindow(), uint64(0); g != w {
+		t.Fatalf("Max sessions checked out during window mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	// Do another cycle with 5 sessions as max. This should now be the new
+	// window max.
+	mw.startNewCycle(5)
+	if g, w := mw.maxSessionsCheckedOutDuringWindow(), uint64(5); g != w {
+		t.Fatalf("Max sessions checked out during window mismatch.\nGot: %d\nWant: %d", g, w)
+	}
+	// Do a couple of cycles so that the only non-zero value is in the middle.
+	// The max for the entire window should still be 5.
+	for i := 0; i < maintenanceWindowSize/2; i++ {
+		mw.startNewCycle(0)
+	}
+	if g, w := mw.maxSessionsCheckedOutDuringWindow(), uint64(5); g != w {
+		t.Fatalf("Max sessions checked out during window mismatch.\nGot: %d\nWant: %d", g, w)
 	}
 }

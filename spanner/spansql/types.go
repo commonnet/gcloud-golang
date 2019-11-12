@@ -28,6 +28,13 @@ type CreateTable struct {
 	Name       string
 	Columns    []ColumnDef
 	PrimaryKey []KeyPart
+	Interleave *Interleave
+}
+
+// Interleave represents an interleave clause of a CREATE TABLE statement.
+type Interleave struct {
+	Parent   string
+	OnDelete OnDelete
 }
 
 // CreateIndex represents a CREATE INDEX statement.
@@ -37,7 +44,11 @@ type CreateIndex struct {
 	Table   string
 	Columns []KeyPart
 
-	// TODO: UNIQUE, NULL_FILTERED, storing_clause, interleave_clause
+	Unique       bool
+	NullFiltered bool
+
+	Storing    []string
+	Interleave string
 }
 
 // DropTable represents a DROP TABLE statement.
@@ -69,11 +80,12 @@ func (SetOnDelete) isTableAlteration() {}
 
 type AddColumn struct{ Def ColumnDef }
 type DropColumn struct{ Name string }
+type SetOnDelete struct{ Action OnDelete }
 
-type SetOnDelete int
+type OnDelete int
 
 const (
-	NoActionOnDelete SetOnDelete = iota
+	NoActionOnDelete OnDelete = iota
 	CascadeOnDelete
 )
 
@@ -137,13 +149,34 @@ type Select struct {
 
 type SelectFrom struct {
 	// This only supports a FROM clause directly from a table.
-	Table string
+	Table       string
+	TableSample *TableSample
 }
 
 type Order struct {
 	Expr Expr
 	Desc bool
 }
+
+type TableSample struct {
+	Method   TableSampleMethod
+	Size     Expr
+	SizeType TableSampleSizeType
+}
+
+type TableSampleMethod int
+
+const (
+	Bernoulli TableSampleMethod = iota
+	Reservoir
+)
+
+type TableSampleSizeType int
+
+const (
+	PercentTableSample TableSampleSizeType = iota
+	RowsTableSample
+)
 
 type BoolExpr interface {
 	isBoolExpr()
@@ -180,7 +213,9 @@ type ComparisonOp struct {
 	LHS, RHS Expr
 	Op       ComparisonOperator
 
-	// TODO: BETWEEN; it needs a third operand.
+	// RHS2 is the third operand for BETWEEN.
+	// "<LHS> BETWEEN <RHS> AND <RHS2>".
+	RHS2 Expr
 }
 
 func (ComparisonOp) isBoolExpr() {}
@@ -197,6 +232,8 @@ const (
 	Ne // both "!=" and "<>"
 	Like
 	NotLike
+	Between
+	NotBetween
 )
 
 type IsOp struct {
@@ -213,6 +250,25 @@ type IsExpr interface {
 	isExpr()
 	SQL() string
 }
+
+// Func represents a function call.
+type Func struct {
+	Name string
+	Args []Expr
+
+	// TODO: various functions permit as-expressions, which might warrant different types in here.
+}
+
+func (Func) isBoolExpr() {} // possibly bool
+func (Func) isExpr()     {}
+
+// Paren represents a parenthesised expression.
+type Paren struct {
+	Expr Expr
+}
+
+func (Paren) isBoolExpr() {} // possibly bool
+func (Paren) isExpr()     {}
 
 // ID represents an identifier.
 type ID string
@@ -263,6 +319,19 @@ func (FloatLiteral) isExpr() {}
 type StringLiteral string
 
 func (StringLiteral) isExpr() {}
+
+// BytesLiteral represents a bytes literal.
+// https://cloud.google.com/spanner/docs/lexical#string-and-bytes-literals
+type BytesLiteral string
+
+func (BytesLiteral) isExpr() {}
+
+type StarExpr int
+
+// Star represents a "*" in an expression.
+const Star = StarExpr(0)
+
+func (StarExpr) isExpr() {}
 
 // DDL
 // https://cloud.google.com/spanner/docs/data-definition-language#ddl_syntax

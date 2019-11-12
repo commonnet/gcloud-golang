@@ -17,6 +17,8 @@ limitations under the License.
 package spansql
 
 import (
+	"fmt"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -55,6 +57,19 @@ func TestParseQuery(t *testing.T) {
 				Limit: Param("limit"),
 			},
 		},
+		{`SELECT COUNT(*) FROM Packages`,
+			Query{
+				Select: Select{
+					List: []Expr{
+						Func{
+							Name: "COUNT",
+							Args: []Expr{Star},
+						},
+					},
+					From: []SelectFrom{{Table: "Packages"}},
+				},
+			},
+		},
 	}
 	for _, test := range tests {
 		got, err := ParseQuery(test.in)
@@ -75,9 +90,16 @@ func TestParseExpr(t *testing.T) {
 	}{
 		{`17`, IntegerLiteral(17)},
 		{`-1`, IntegerLiteral(-1)},
+		{fmt.Sprintf(`%d`, math.MaxInt64), IntegerLiteral(math.MaxInt64)},
+		{fmt.Sprintf(`%d`, math.MinInt64), IntegerLiteral(math.MinInt64)},
+		{"1.797693134862315708145274237317043567981e+308", FloatLiteral(math.MaxFloat64)},
+		{`4.940656458412465441765687928682213723651e-324`, FloatLiteral(math.SmallestNonzeroFloat64)},
 		{`0xf00d`, IntegerLiteral(0xf00d)},
 		{`-0xbeef`, IntegerLiteral(-0xbeef)},
+		{`0XabCD`, IntegerLiteral(0xabcd)},
+		{`-0XBEEF`, IntegerLiteral(-0xbeef)},
 		{`123.456e-67`, FloatLiteral(123.456e-67)},
+		{`-123.456e-67`, FloatLiteral(-123.456e-67)},
 		{`.1E4`, FloatLiteral(0.1e4)},
 		{`58.`, FloatLiteral(58)},
 		{`4e2`, FloatLiteral(4e2)},
@@ -85,10 +107,62 @@ func TestParseExpr(t *testing.T) {
 		{`Name LIKE "Eve %"`, ComparisonOp{LHS: ID("Name"), Op: Like, RHS: StringLiteral("Eve %")}},
 		{`Speech NOT LIKE "_oo"`, ComparisonOp{LHS: ID("Speech"), Op: NotLike, RHS: StringLiteral("_oo")}},
 		{`A AND NOT B`, LogicalOp{LHS: ID("A"), Op: And, RHS: LogicalOp{Op: Not, RHS: ID("B")}}},
+		{`X BETWEEN Y AND Z`, ComparisonOp{LHS: ID("X"), Op: Between, RHS: ID("Y"), RHS2: ID("Z")}},
+
+		// String literal:
+		// Accept double quote and single quote.
+		{`"hello"`, StringLiteral("hello")},
+		{`'hello'`, StringLiteral("hello")},
+		// Accept triple-quote.
+		{`""" "hello" "world" """`, StringLiteral(` "hello" "world" `)},
+		{"''' 'hello'\n'world' '''", StringLiteral(" 'hello'\n'world' ")},
+		// Simple escape sequence
+		{`"\a\b\f\n\r\t\v\\\?\"\'"`, StringLiteral("\a\b\f\n\r\t\v\\?\"'")},
+		{`'\a\b\f\n\r\t\v\\\?\"\''`, StringLiteral("\a\b\f\n\r\t\v\\?\"'")},
+		{"'\\`'", StringLiteral("`")},
+		// Hex and unicode escape sequence
+		{`"\060\x30\X30\u0030\U00000030"`, StringLiteral("00000")},
+		{`'\060\x30\X30\u0030\U00000030'`, StringLiteral("00000")},
+		{`"\uBEAF\ubeaf"`, StringLiteral("\ubeaf\ubeaf")},
+		{`'\uBEAF\ubeaf'`, StringLiteral("\ubeaf\ubeaf")},
+		// Escape sequence in triple quote is allowed.
+		{`"""\u0030"""`, StringLiteral("0")},
+		{`'''\u0030'''`, StringLiteral("0")},
+		// Raw string literal
+		{`R"\\"`, StringLiteral("\\\\")},
+		{`R'\\'`, StringLiteral("\\\\")},
+		{`r"\\"`, StringLiteral("\\\\")},
+		{`r'\\'`, StringLiteral("\\\\")},
+		{`R"\\\""`, StringLiteral("\\\\\\\"")},
+		{`R"""\\//\\//"""`, StringLiteral("\\\\//\\\\//")},
+		{"R'''\\\\//\n\\\\//'''", StringLiteral("\\\\//\n\\\\//")},
+
+		// Bytes literal:
+		{`B"hello"`, BytesLiteral("hello")},
+		{`B'hello'`, BytesLiteral("hello")},
+		{`b"hello"`, BytesLiteral("hello")},
+		{`b'hello'`, BytesLiteral("hello")},
+		{`B""" "hello" "world" """`, BytesLiteral(` "hello" "world" `)},
+		{`B''' 'hello' 'world' '''`, BytesLiteral(` 'hello' 'world' `)},
+		{`B"\a\b\f\n\r\t\v\\\?\"\'"`, BytesLiteral("\a\b\f\n\r\t\v\\?\"'")},
+		{`B'\a\b\f\n\r\t\v\\\?\"\''`, BytesLiteral("\a\b\f\n\r\t\v\\?\"'")},
+		{"B'''\n'''", BytesLiteral("\n")},
+		{`br"\\"`, BytesLiteral("\\\\")},
+		{`br'\\'`, BytesLiteral("\\\\")},
+		{`rb"\\"`, BytesLiteral("\\\\")},
+		{`rb'\\'`, BytesLiteral("\\\\")},
+		{`RB"\\"`, BytesLiteral("\\\\")},
+		{`RB'\\'`, BytesLiteral("\\\\")},
+		{`BR"\\"`, BytesLiteral("\\\\")},
+		{`BR'\\'`, BytesLiteral("\\\\")},
+		{`RB"""\\//\\//"""`, BytesLiteral("\\\\//\\\\//")},
+		{"RB'''\\\\//\n\\\\//'''", BytesLiteral("\\\\//\n\\\\//")},
 
 		// OR is lower precedence than AND.
 		{`A AND B OR C`, LogicalOp{LHS: LogicalOp{LHS: ID("A"), Op: And, RHS: ID("B")}, Op: Or, RHS: ID("C")}},
 		{`A OR B AND C`, LogicalOp{LHS: ID("A"), Op: Or, RHS: LogicalOp{LHS: ID("B"), Op: And, RHS: ID("C")}}},
+		// Parens to override normal precedence.
+		{`A OR (B AND C)`, LogicalOp{LHS: ID("A"), Op: Or, RHS: Paren{Expr: LogicalOp{LHS: ID("B"), Op: And, RHS: ID("C")}}}},
 
 		// This is the same as the WHERE clause from the test in ParseQuery.
 		{`Age < @ageLimit AND Alias IS NOT NULL`,
@@ -139,9 +213,15 @@ func TestParseDDL(t *testing.T) {
 			Count INT64, /* This is a
 			              * multiline comment. */
 		) PRIMARY KEY(System, RepoPath);
-		CREATE INDEX MyFirstIndex ON FooBar (
+		CREATE UNIQUE INDEX MyFirstIndex ON FooBar (
 			Count DESC
-		);
+		) STORING (Count), INTERLEAVE IN SomeTable;
+		CREATE TABLE FooBarAux (
+			System STRING(MAX) NOT NULL,
+			RepoPath STRING(MAX) NOT NULL,
+			Author STRING(MAX) NOT NULL,
+		) PRIMARY KEY(System, RepoPath, Author),
+		  INTERLEAVE IN PARENT FooBar ON DELETE CASCADE;
 
 		ALTER TABLE FooBar ADD COLUMN TZ BYTES(20);
 		ALTER TABLE FooBar DROP COLUMN TZ;
@@ -169,15 +249,35 @@ func TestParseDDL(t *testing.T) {
 				},
 			},
 			CreateIndex{
-				Name:    "MyFirstIndex",
-				Table:   "FooBar",
-				Columns: []KeyPart{{Column: "Count", Desc: true}},
+				Name:       "MyFirstIndex",
+				Table:      "FooBar",
+				Columns:    []KeyPart{{Column: "Count", Desc: true}},
+				Unique:     true,
+				Storing:    []string{"Count"},
+				Interleave: "SomeTable",
+			},
+			CreateTable{
+				Name: "FooBarAux",
+				Columns: []ColumnDef{
+					{Name: "System", Type: Type{Base: String, Len: MaxLen}, NotNull: true},
+					{Name: "RepoPath", Type: Type{Base: String, Len: MaxLen}, NotNull: true},
+					{Name: "Author", Type: Type{Base: String, Len: MaxLen}, NotNull: true},
+				},
+				PrimaryKey: []KeyPart{
+					{Column: "System"},
+					{Column: "RepoPath"},
+					{Column: "Author"},
+				},
+				Interleave: &Interleave{
+					Parent:   "FooBar",
+					OnDelete: CascadeOnDelete,
+				},
 			},
 			AlterTable{Name: "FooBar", Alteration: AddColumn{
 				Def: ColumnDef{Name: "TZ", Type: Type{Base: Bytes, Len: 20}},
 			}},
 			AlterTable{Name: "FooBar", Alteration: DropColumn{Name: "TZ"}},
-			AlterTable{Name: "FooBar", Alteration: NoActionOnDelete},
+			AlterTable{Name: "FooBar", Alteration: SetOnDelete{Action: NoActionOnDelete}},
 			DropIndex{Name: "MyFirstIndex"},
 			DropTable{Name: "FooBar"},
 			CreateTable{
@@ -222,6 +322,30 @@ func TestParseFailures(t *testing.T) {
 	}{
 		{expr, `0b337`, "binary literal"},
 		{expr, `"foo\`, "unterminated string"},
+		{expr, `"\i"`, "invalid escape sequence"},
+		{expr, `"\0"`, "invalid escape sequence"},
+		{expr, `"\099"`, "invalid escape sequence"},
+		{expr, `"\400"`, "invalid escape sequence: octal digits overflow"},
+		{expr, `"\x"`, "invalid escape sequence"},
+		{expr, `"\xFZ"`, "invalid escape sequence"},
+		{expr, `"\u"`, "invalid escape sequence"},
+		{expr, `"\uFFFZ"`, "invalid escape sequence"},
+		{expr, `"\uD800"`, "invalid unicode character (surrogate)"},
+		{expr, `"\U"`, "invalid escape sequence"},
+		{expr, `"\UFFFFFFFZ"`, "invalid escape sequence"},
+		{expr, `"\U00110000"`, "invalid unicode character (out of range)"},
+		{expr, "\"\n\"", "unterminated string by newline (double quote)"},
+		{expr, "'\n'", "unterminated string by newline (single quote)"},
+		{expr, "R\"\n\"", "unterminated raw string by newline (double quote)"},
+		{expr, "R'\n'", "unterminated raw string by newline (single quote)"},
+		{expr, `B"\u0030"`, "\\uXXXX sequence is not supported in bytes literal (double quote)"},
+		{expr, `B'\u0030'`, "\\uXXXX sequence is not supported in bytes literal (double quote)"},
+		{expr, `B"\U00000030"`, "\\UXXXXXXXX sequence is not supported in bytes literal (double quote)"},
+		{expr, `B'\U00000030'`, "\\UXXXXXXXX sequence is not supported in bytes literal (double quote)"},
+		{expr, `BB""`, "invalid string-like literal prefix"},
+		{expr, `rr""`, "invalid string-like literal prefix"},
+		{expr, `"""\"""`, "unterminated triple-quoted string by last backslash (double quote)"},
+		{expr, `'''\'''`, "unterminated triple-quoted string by last backslash (single quote)"},
 		{expr, `"foo" AND "bar"`, "logical operation on string literals"},
 	}
 	for _, test := range tests {

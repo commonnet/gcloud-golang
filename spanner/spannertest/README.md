@@ -15,16 +15,14 @@ should use the production Cloud Spanner instead.
 Here's a list of features that are missing or incomplete. It is roughly ordered
 by ascending esotericism:
 
-- ARRAY types
 - SELECT GROUP BY
 - SELECT HAVING
 - arithmetic expressions (operators, parens)
-- LIKE operator
 - transaction simulation
 - DML statements
 - case insensitivity
 - alternate literal types (esp. strings)
-- DATE, TIMESTAMP types
+- TIMESTAMP types
 - STRUCT types
 - expression functions
 - expression type casting, coercion
@@ -34,8 +32,7 @@ by ascending esotericism:
 - subselects
 - set operations (UNION, INTERSECT, EXCEPT)
 - SELECT star expressions
-- BETWEEN
 - partition support
 - conditional expressions
-- table sampling
+- table sampling (implementation)
 - hints for table/joins

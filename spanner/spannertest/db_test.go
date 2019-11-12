@@ -102,7 +102,7 @@ func TestTableData(t *testing.T) {
 		t.Fatalf("Inserting more data: %v", err)
 	}
 	// Delete that last one.
-	err = db.Delete("Staff", []*structpb.ListValue{listV(stringV("Harry"), stringV("6"))}, false)
+	err = db.Delete("Staff", []*structpb.ListValue{listV(stringV("Harry"), stringV("6"))}, nil, false)
 	if err != nil {
 		t.Fatalf("Deleting a row: %v", err)
 	}
@@ -148,13 +148,53 @@ func TestTableData(t *testing.T) {
 	}
 	all = slurp(ri)
 	wantAll = [][]interface{}{
-		{int64(10), "Jack", 1.85},
+		// Primary key is (Name, ID), so results should come back sorted by Name then ID.
 		{int64(11), "Daniel", 1.83},
+		{int64(6), "George", 1.73},
+		{int64(10), "Jack", 1.85},
 		{int64(9), "Sam", 1.75},
-		{int64(8), "Teal'c", 1.91},
 	}
 	if !reflect.DeepEqual(all, wantAll) {
 		t.Errorf("ReadAll data wrong.\n got %v\nwant %v", all, wantAll)
+	}
+
+	// Add a DATE column, populate it with some data.
+	st = db.ApplyDDL(spansql.AlterTable{
+		Name: "Staff",
+		Alteration: spansql.AddColumn{Def: spansql.ColumnDef{
+			Name: "FirstSeen",
+			Type: spansql.Type{Base: spansql.Date},
+		}},
+	})
+	if st.Code() != codes.OK {
+		t.Fatalf("Adding column: %v", st.Err())
+	}
+	err = db.Update("Staff", []string{"Name", "ID", "FirstSeen"}, []*structpb.ListValue{
+		listV(stringV("Jack"), stringV("1"), stringV("1994-10-28")),
+		listV(stringV("Daniel"), stringV("2"), stringV("1994-10-28")),
+		listV(stringV("George"), stringV("5"), stringV("1997-07-27")),
+	})
+	if err != nil {
+		t.Fatalf("Updating rows: %v", err)
+	}
+
+	// Add some more data, then delete it with a KeyRange.
+	// The queries below ensure that this was all deleted.
+	err = db.Insert("Staff", []string{"Name", "ID"}, []*structpb.ListValue{
+		listV(stringV("01"), stringV("1")),
+		listV(stringV("03"), stringV("3")),
+		listV(stringV("06"), stringV("6")),
+	})
+	if err != nil {
+		t.Fatalf("Inserting data: %v", err)
+	}
+	err = db.Delete("Staff", nil, keyRangeList{{
+		start:       listV(stringV("01"), stringV("1")),
+		startClosed: true,
+		end:         listV(stringV("9")),
+	}}, false)
+	if err != nil {
+		t.Fatalf("Deleting key range: %v", err)
 	}
 
 	// Do some complex queries.
@@ -164,9 +204,9 @@ func TestTableData(t *testing.T) {
 		want   [][]interface{}
 	}{
 		{
-			`SELECT 17, "sweet", TRUE AND FALSE, NULL`,
+			`SELECT 17, "sweet", TRUE AND FALSE, NULL, B"hello"`,
 			nil,
-			[][]interface{}{{int64(17), "sweet", false, nil}},
+			[][]interface{}{{int64(17), "sweet", false, nil, []byte("hello")}},
 		},
 		{
 			`SELECT Name FROM Staff WHERE Cool`,
@@ -212,6 +252,37 @@ func TestTableData(t *testing.T) {
 				{"Jack", 1.85},
 			},
 		},
+		{
+			`SELECT Name FROM Staff WHERE Name LIKE "J%k" OR Name LIKE "_am"`,
+			nil,
+			[][]interface{}{
+				{"Jack"},
+				{"Sam"},
+			},
+		},
+		{
+			`SELECT Name, Height FROM Staff WHERE Height BETWEEN @min AND @max ORDER BY Height DESC`,
+			queryParams{"min": 1.75, "max": 1.85},
+			[][]interface{}{
+				{"Jack", 1.85},
+				{"Daniel", 1.83},
+				{"Sam", 1.75},
+			},
+		},
+		{
+			`SELECT COUNT(*) FROM Staff WHERE Name < "T"`,
+			nil,
+			[][]interface{}{
+				{int64(4)},
+			},
+		},
+		{
+			`SELECT Name FROM Staff WHERE FirstSeen >= @min`,
+			queryParams{"min": "1996-01-01"},
+			[][]interface{}{
+				{"George"},
+			},
+		},
 	}
 	for _, test := range tests {
 		q, err := spansql.ParseQuery(test.q)
@@ -246,3 +317,157 @@ func stringV(s string) *structpb.Value                { return &structpb.Value{K
 func floatV(f float64) *structpb.Value                { return &structpb.Value{Kind: &structpb.Value_NumberValue{f}} }
 func boolV(b bool) *structpb.Value                    { return &structpb.Value{Kind: &structpb.Value_BoolValue{b}} }
 func nullV() *structpb.Value                          { return &structpb.Value{Kind: &structpb.Value_NullValue{}} }
+
+func TestRowCmp(t *testing.T) {
+	r := func(x ...interface{}) []interface{} { return x }
+	tests := []struct {
+		a, b []interface{}
+		want int
+	}{
+		{r(int64(1), "foo", 1.6), r(int64(1), "foo", 1.6), 0},
+		{r(int64(1), "foo"), r(int64(1), "foo", 1.6), 0}, // first is shorter
+
+		{r(int64(1), "bar", 1.8), r(int64(1), "foo", 1.6), -1},
+		{r(int64(1), "foo", 1.6), r(int64(1), "bar", 1.8), 1},
+	}
+	for _, test := range tests {
+		if got := rowCmp(test.a, test.b); got != test.want {
+			t.Errorf("rowCmp(%v, %v) = %d, want %d", test.a, test.b, got, test.want)
+		}
+	}
+}
+
+func TestKeyRange(t *testing.T) {
+	r := func(x ...interface{}) []interface{} { return x }
+	closedClosed := func(start, end []interface{}) *keyRange {
+		return &keyRange{
+			startKey:    start,
+			endKey:      end,
+			startClosed: true,
+			endClosed:   true,
+		}
+	}
+	halfOpen := func(start, end []interface{}) *keyRange {
+		return &keyRange{
+			startKey:    start,
+			endKey:      end,
+			startClosed: true,
+		}
+	}
+	openOpen := func(start, end []interface{}) *keyRange {
+		return &keyRange{
+			startKey: start,
+			endKey:   end,
+		}
+	}
+	tests := []struct {
+		kr      *keyRange
+		include [][]interface{}
+		exclude [][]interface{}
+	}{
+		// Examples from google/spanner/v1/keys.proto.
+		{
+			kr: closedClosed(r("Bob", "2015-01-01"), r("Bob", "2015-12-31")),
+			include: [][]interface{}{
+				r("Bob", "2015-01-01"),
+				r("Bob", "2015-07-07"),
+				r("Bob", "2015-12-31"),
+			},
+			exclude: [][]interface{}{
+				r("Alice", "2015-07-07"),
+				r("Bob", "2014-12-31"),
+				r("Bob", "2016-01-01"),
+			},
+		},
+		{
+			kr: closedClosed(r("Bob", "2000-01-01"), r("Bob")),
+			include: [][]interface{}{
+				r("Bob", "2000-01-01"),
+				r("Bob", "2022-07-07"),
+			},
+			exclude: [][]interface{}{
+				r("Alice", "2015-07-07"),
+				r("Bob", "1999-11-07"),
+			},
+		},
+		{
+			kr: closedClosed(r("Bob"), r("Bob")),
+			include: [][]interface{}{
+				r("Bob", "2000-01-01"),
+			},
+			exclude: [][]interface{}{
+				r("Alice", "2015-07-07"),
+				r("Charlie", "1999-11-07"),
+			},
+		},
+		{
+			kr: halfOpen(r("Bob"), r("Bob", "2000-01-01")),
+			include: [][]interface{}{
+				r("Bob", "1999-11-07"),
+			},
+			exclude: [][]interface{}{
+				r("Alice", "1999-11-07"),
+				r("Bob", "2000-01-01"),
+				r("Bob", "2004-07-07"),
+				r("Charlie", "1999-11-07"),
+			},
+		},
+		{
+			kr: openOpen(r("Bob", "1999-11-06"), r("Bob", "2000-01-01")),
+			include: [][]interface{}{
+				r("Bob", "1999-11-07"),
+			},
+			exclude: [][]interface{}{
+				r("Alice", "1999-11-07"),
+				r("Bob", "1999-11-06"),
+				r("Bob", "2000-01-01"),
+				r("Bob", "2004-07-07"),
+				r("Charlie", "1999-11-07"),
+			},
+		},
+		{
+			kr: closedClosed(r(), r()),
+			include: [][]interface{}{
+				r("Alice", "1999-11-07"),
+				r("Bob", "1999-11-07"),
+				r("Charlie", "1999-11-07"),
+			},
+		},
+		{
+			kr: halfOpen(r("A"), r("D")),
+			include: [][]interface{}{
+				r("Alice", "1999-11-07"),
+				r("Bob", "1999-11-07"),
+				r("Charlie", "1999-11-07"),
+			},
+			exclude: [][]interface{}{
+				r("0day", "1999-11-07"),
+				r("Doris", "1999-11-07"),
+			},
+		},
+	}
+	for _, test := range tests {
+		tbl := &table{
+			pkCols: 2,
+		}
+		for _, pk := range append(test.include, test.exclude...) {
+			rowNum, _ := tbl.rowForPK(pk)
+			tbl.insertRow(rowNum, pk)
+		}
+		start, end := tbl.findRange(test.kr)
+		has := func(pk []interface{}) bool {
+			n, _ := tbl.rowForPK(pk)
+			return start <= n && n < end
+		}
+		for _, pk := range test.include {
+			if !has(pk) {
+				t.Errorf("keyRange %v does not include %v", test.kr, pk)
+			}
+		}
+		for _, pk := range test.exclude {
+			if has(pk) {
+				t.Errorf("keyRange %v includes %v", test.kr, pk)
+			}
+		}
+	}
+}

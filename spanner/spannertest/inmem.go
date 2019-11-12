@@ -46,6 +46,7 @@ package spannertest
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"math/rand"
@@ -55,6 +56,7 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -62,6 +64,7 @@ import (
 	anypb "github.com/golang/protobuf/ptypes/any"
 	emptypb "github.com/golang/protobuf/ptypes/empty"
 	structpb "github.com/golang/protobuf/ptypes/struct"
+	timestamppb "github.com/golang/protobuf/ptypes/timestamp"
 	lropb "google.golang.org/genproto/googleapis/longrunning"
 	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 	spannerpb "google.golang.org/genproto/googleapis/spanner/v1"
@@ -99,13 +102,41 @@ type server struct {
 }
 
 type session struct {
+	name     string
+	creation time.Time
+
 	// This context tracks the lifetime of this session.
 	// It is canceled in DeleteSession.
 	ctx    context.Context
 	cancel func()
 
 	mu           sync.Mutex
+	lastUse      time.Time
 	transactions map[string]*transaction
+}
+
+func (s *session) Proto() *spannerpb.Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := &spannerpb.Session{
+		Name:                   s.name,
+		CreateTime:             timestampProto(s.creation),
+		ApproximateLastUseTime: timestampProto(s.lastUse),
+	}
+	return m
+}
+
+// timestampProto returns a valid timestamp.Timestamp,
+// or nil if the given time is zero or isn't representable.
+func timestampProto(t time.Time) *timestamppb.Timestamp {
+	if t.IsZero() {
+		return nil
+	}
+	ts, err := ptypes.TimestampProto(t)
+	if err != nil {
+		return nil
+	}
+	return ts
 }
 
 type transaction struct {
@@ -277,9 +308,16 @@ func (s *server) runOneDDL(ctx context.Context, stmt spansql.DDLStmt) *status.St
 
 func (s *server) CreateSession(ctx context.Context, req *spannerpb.CreateSessionRequest) (*spannerpb.Session, error) {
 	s.logf("CreateSession(%q)", req.Database)
+	return s.newSession(), nil
+}
 
+func (s *server) newSession() *spannerpb.Session {
 	id := genRandomSession()
+	now := time.Now()
 	sess := &session{
+		name:         id,
+		creation:     now,
+		lastUse:      now,
 		transactions: make(map[string]*transaction),
 	}
 	sess.ctx, sess.cancel = context.WithCancel(context.Background())
@@ -288,12 +326,34 @@ func (s *server) CreateSession(ctx context.Context, req *spannerpb.CreateSession
 	s.sessions[id] = sess
 	s.mu.Unlock()
 
-	// TODO: do we need to track creation/use times? labels?
-
-	return &spannerpb.Session{Name: id}, nil
+	return sess.Proto()
 }
 
-// TODO: GetSession, ListSessions
+func (s *server) BatchCreateSessions(ctx context.Context, req *spannerpb.BatchCreateSessionsRequest) (*spannerpb.BatchCreateSessionsResponse, error) {
+	s.logf("BatchCreateSessions(%q)", req.Database)
+
+	var sessions []*spannerpb.Session
+	for i := int32(0); i < req.GetSessionCount(); i++ {
+		sessions = append(sessions, s.newSession())
+	}
+
+	return &spannerpb.BatchCreateSessionsResponse{Session: sessions}, nil
+}
+
+func (s *server) GetSession(ctx context.Context, req *spannerpb.GetSessionRequest) (*spannerpb.Session, error) {
+	s.mu.Lock()
+	sess, ok := s.sessions[req.Name]
+	s.mu.Unlock()
+
+	if !ok {
+		// TODO: what error does the real Spanner return?
+		return nil, status.Errorf(codes.NotFound, "unknown session %q", req.Name)
+	}
+
+	return sess.Proto(), nil
+}
+
+// TODO: ListSessions
 
 func (s *server) DeleteSession(ctx context.Context, req *spannerpb.DeleteSessionRequest) (*emptypb.Empty, error) {
 	s.logf("DeleteSession(%q)", req.Name)
@@ -326,6 +386,7 @@ func (s *server) popTx(sessionID, tid string) (tx *transaction, cleanup func(), 
 	}
 
 	sess.mu.Lock()
+	sess.lastUse = time.Now()
 	tx, ok = sess.transactions[tid]
 	if ok {
 		delete(sess.transactions, tid)
@@ -342,12 +403,16 @@ func (s *server) popTx(sessionID, tid string) (tx *transaction, cleanup func(), 
 // It is used by read/query operations (ExecuteStreamingSql, StreamingRead).
 func (s *server) readTx(ctx context.Context, session string, tsel *spannerpb.TransactionSelector) (tx *transaction, cleanup func(), err error) {
 	s.mu.Lock()
-	_, ok := s.sessions[session]
+	sess, ok := s.sessions[session]
 	s.mu.Unlock()
 	if !ok {
 		// TODO: what error does the real Spanner return?
 		return nil, nil, status.Errorf(codes.NotFound, "unknown session %q", session)
 	}
+
+	sess.mu.Lock()
+	sess.lastUse = time.Now()
+	sess.mu.Unlock()
 
 	singleUse := func() (*transaction, func(), error) {
 		tx := &transaction{}
@@ -375,6 +440,11 @@ func (s *server) readTx(ctx context.Context, session string, tsel *spannerpb.Tra
 		default:
 			return nil, nil, fmt.Errorf("single use transaction in mode %T not supported", mode)
 		}
+	case *spannerpb.TransactionSelector_Id:
+		id := sel.Id // []byte
+		_ = id       // TODO: lookup an existing transaction by ID.
+		tx := &transaction{}
+		return tx, tx.finish, nil
 	}
 }
 
@@ -515,7 +585,7 @@ func (s *server) readStream(ctx context.Context, tx *transaction, send func(*spa
 }
 
 func (s *server) BeginTransaction(ctx context.Context, req *spannerpb.BeginTransactionRequest) (*spannerpb.Transaction, error) {
-	s.logf("BeginTransaction(%v)", req)
+	//s.logf("BeginTransaction(%v)", req)
 
 	s.mu.Lock()
 	sess, ok := s.sessions[req.Session]
@@ -529,6 +599,7 @@ func (s *server) BeginTransaction(ctx context.Context, req *spannerpb.BeginTrans
 	tx := &transaction{}
 
 	sess.mu.Lock()
+	sess.lastUse = time.Now()
 	sess.transactions[id] = tx
 	sess.mu.Unlock()
 
@@ -536,7 +607,7 @@ func (s *server) BeginTransaction(ctx context.Context, req *spannerpb.BeginTrans
 }
 
 func (s *server) Commit(ctx context.Context, req *spannerpb.CommitRequest) (*spannerpb.CommitResponse, error) {
-	s.logf("Commit(%q, %q)", req.Session, req.Transaction)
+	//s.logf("Commit(%q, %q)", req.Session, req.Transaction)
 
 	obj, ok := req.Transaction.(*spannerpb.CommitRequest_TransactionId)
 	if !ok {
@@ -566,13 +637,17 @@ func (s *server) Commit(ctx context.Context, req *spannerpb.CommitRequest) (*spa
 			if err != nil {
 				return nil, err
 			}
+		case *spannerpb.Mutation_InsertOrUpdate:
+			iou := op.InsertOrUpdate
+			err := s.db.InsertOrUpdate(iou.Table, iou.Columns, iou.Values)
+			if err != nil {
+				return nil, err
+			}
 		case *spannerpb.Mutation_Delete_:
 			del := op.Delete
 			ks := del.KeySet
-			if len(ks.Ranges) > 0 {
-				return nil, fmt.Errorf("deleting key ranges unsupported")
-			}
-			err := s.db.Delete(del.Table, ks.Keys, ks.All)
+
+			err := s.db.Delete(del.Table, ks.Keys, makeKeyRangeList(ks.Ranges), ks.All)
 			if err != nil {
 				return nil, err
 			}
@@ -607,7 +682,6 @@ func (s *server) Rollback(ctx context.Context, req *spannerpb.RollbackRequest) (
 // TODO: PartitionQuery, PartitionRead
 
 func spannerTypeFromType(typ spansql.Type) (*spannerpb.Type, error) {
-	// TODO: array types
 	var code spannerpb.TypeCode
 	switch typ.Base {
 	default:
@@ -622,14 +696,25 @@ func spannerTypeFromType(typ spansql.Type) (*spannerpb.Type, error) {
 		code = spannerpb.TypeCode_STRING
 	case spansql.Bytes:
 		code = spannerpb.TypeCode_BYTES
+	case spansql.Date:
+		code = spannerpb.TypeCode_DATE
 	}
-	return &spannerpb.Type{Code: code}, nil
+	st := &spannerpb.Type{Code: code}
+	if typ.Array {
+		st = &spannerpb.Type{
+			Code:             spannerpb.TypeCode_ARRAY,
+			ArrayElementType: st,
+		}
+	}
+	return st, nil
 }
 
 func spannerValueFromValue(x interface{}) (*structpb.Value, error) {
 	switch x := x.(type) {
 	default:
 		return nil, fmt.Errorf("unhandled database value type %T", x)
+	case bool:
+		return &structpb.Value{Kind: &structpb.Value_BoolValue{x}}, nil
 	case int64:
 		// The Spanner int64 is actually a decimal string.
 		s := strconv.FormatInt(x, 10)
@@ -638,7 +723,48 @@ func spannerValueFromValue(x interface{}) (*structpb.Value, error) {
 		return &structpb.Value{Kind: &structpb.Value_NumberValue{x}}, nil
 	case string:
 		return &structpb.Value{Kind: &structpb.Value_StringValue{x}}, nil
+	case []byte:
+		return &structpb.Value{Kind: &structpb.Value_StringValue{base64.StdEncoding.EncodeToString(x)}}, nil
 	case nil:
 		return &structpb.Value{Kind: &structpb.Value_NullValue{}}, nil
+	case []interface{}:
+		var vs []*structpb.Value
+		for _, elem := range x {
+			v, err := spannerValueFromValue(elem)
+			if err != nil {
+				return nil, err
+			}
+			vs = append(vs, v)
+		}
+		return &structpb.Value{Kind: &structpb.Value_ListValue{
+			&structpb.ListValue{Values: vs},
+		}}, nil
 	}
+}
+
+func makeKeyRangeList(ranges []*spannerpb.KeyRange) keyRangeList {
+	var krl keyRangeList
+	for _, r := range ranges {
+		krl = append(krl, makeKeyRange(r))
+	}
+	return krl
+}
+
+func makeKeyRange(r *spannerpb.KeyRange) *keyRange {
+	var kr keyRange
+	switch s := r.StartKeyType.(type) {
+	case *spannerpb.KeyRange_StartClosed:
+		kr.start = s.StartClosed
+		kr.startClosed = true
+	case *spannerpb.KeyRange_StartOpen:
+		kr.start = s.StartOpen
+	}
+	switch e := r.EndKeyType.(type) {
+	case *spannerpb.KeyRange_EndClosed:
+		kr.end = e.EndClosed
+		kr.endClosed = true
+	case *spannerpb.KeyRange_EndOpen:
+		kr.end = e.EndOpen
+	}
+	return &kr
 }

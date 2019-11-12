@@ -19,7 +19,10 @@ package spansql
 // This file holds SQL methods for rendering the types in types.go
 // as the SQL dialect that this package parses.
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 func (ct CreateTable) SQL() string {
 	str := "CREATE TABLE " + ct.Name + " (\n"
@@ -34,11 +37,21 @@ func (ct CreateTable) SQL() string {
 		str += c.SQL()
 	}
 	str += ")"
+	if il := ct.Interleave; il != nil {
+		str += ",\n  INTERLEAVE IN PARENT " + il.Parent + " ON DELETE " + il.OnDelete.SQL()
+	}
 	return str
 }
 
 func (ci CreateIndex) SQL() string {
-	str := "CREATE INDEX " + ci.Name + " ON " + ci.Table + "("
+	str := "CREATE"
+	if ci.Unique {
+		str += " UNIQUE"
+	}
+	if ci.NullFiltered {
+		str += " NULL_FILTERED"
+	}
+	str += " INDEX " + ci.Name + " ON " + ci.Table + "("
 	for i, c := range ci.Columns {
 		if i > 0 {
 			str += ", "
@@ -46,6 +59,14 @@ func (ci CreateIndex) SQL() string {
 		str += c.SQL()
 	}
 	str += ")"
+	if len(ci.Storing) > 0 {
+		str += " STORING ("
+		str += strings.Join(ci.Storing, ", ")
+		str += ")"
+	}
+	if ci.Interleave != "" {
+		str += ", INTERLEAVE IN " + ci.Interleave
+	}
 	return str
 }
 
@@ -70,13 +91,17 @@ func (dc DropColumn) SQL() string {
 }
 
 func (sod SetOnDelete) SQL() string {
-	switch sod {
+	return "SET ON DELETE " + sod.Action.SQL()
+}
+
+func (od OnDelete) SQL() string {
+	switch od {
 	case NoActionOnDelete:
-		return "SET ON DELETE NO ACTION"
+		return "NO ACTION"
 	case CascadeOnDelete:
-		return "SET ON DELETE CASCADE"
+		return "CASCADE"
 	}
-	panic("unknown SetOnDelete")
+	panic("unknown OnDelete")
 }
 
 // TODO func (ac AlterColumn) SQL() string { }
@@ -196,14 +221,16 @@ func (lo LogicalOp) SQL() string {
 }
 
 var compOps = map[ComparisonOperator]string{
-	Lt:      "<",
-	Le:      "<=",
-	Gt:      ">",
-	Ge:      ">=",
-	Eq:      "=",
-	Ne:      "!=",
-	Like:    "LIKE",
-	NotLike: "NOT LIKE",
+	Lt:         "<",
+	Le:         "<=",
+	Gt:         ">",
+	Ge:         ">=",
+	Eq:         "=",
+	Ne:         "!=",
+	Like:       "LIKE",
+	NotLike:    "NOT LIKE",
+	Between:    "BETWEEN",
+	NotBetween: "NOT BETWEEN",
 }
 
 func (co ComparisonOp) SQL() string {
@@ -211,7 +238,11 @@ func (co ComparisonOp) SQL() string {
 	if !ok {
 		panic("unknown ComparisonOp")
 	}
-	return co.LHS.SQL() + " " + op + " " + co.RHS.SQL()
+	s := co.LHS.SQL() + " " + op + " " + co.RHS.SQL()
+	if co.Op == Between || co.Op == NotBetween {
+		s += " AND " + co.RHS2.SQL()
+	}
+	return s
 }
 
 func (io IsOp) SQL() string {
@@ -222,6 +253,20 @@ func (io IsOp) SQL() string {
 	str += io.RHS.SQL()
 	return str
 }
+
+func (f Func) SQL() string {
+	str := f.Name + "("
+	for i, e := range f.Args {
+		if i > 0 {
+			str += ", "
+		}
+		str += e.SQL()
+	}
+	str += ")"
+	return str
+}
+
+func (p Paren) SQL() string { return "(" + p.Expr.SQL() + ")" }
 
 func (id ID) SQL() string   { return string(id) }
 func (p Param) SQL() string { return "@" + string(p) }
@@ -234,7 +279,12 @@ func (b BoolLiteral) SQL() string {
 }
 
 func (n NullLiteral) SQL() string { return "NULL" }
+func (StarExpr) SQL() string      { return "*" }
 
 func (il IntegerLiteral) SQL() string { return strconv.Itoa(int(il)) }
 func (fl FloatLiteral) SQL() string   { return strconv.FormatFloat(float64(fl), 'g', -1, 64) }
-func (sl StringLiteral) SQL() string  { return strconv.Quote(string(sl)) }
+
+// TODO: provide correct string quote method and use it.
+
+func (sl StringLiteral) SQL() string { return strconv.Quote(string(sl)) }
+func (bl BytesLiteral) SQL() string  { return "B" + strconv.Quote(string(bl)) }

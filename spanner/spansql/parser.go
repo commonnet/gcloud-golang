@@ -36,7 +36,7 @@ This file is structured as follows:
 - The token and parser types are defined. These constitute the lexical token
   and parser machinery. parser.next is the main way that other functions get
   the next token, with parser.back providing a single token rewind, and
-  parser.sniff and parser.expect providing lookahead helpers.
+  parser.sniff, parser.eat and parser.expect providing lookahead helpers.
 - The parseFoo methods are defined, matching the SQL grammar. Each consumes its
   namesake production from the parser. There are also some fooParser helper vars
   defined that abbreviate the parsing of some of the regular productions.
@@ -48,6 +48,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const debug = false
@@ -137,6 +138,7 @@ const (
 	int64Token
 	float64Token
 	stringToken
+	bytesToken
 )
 
 func (t *token) String() string {
@@ -218,6 +220,14 @@ func isIdentifierChar(c byte) bool {
 	return false
 }
 
+func isHexDigit(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func isOctalDigit(c byte) bool {
+	return '0' <= c && c <= '7'
+}
+
 func (p *parser) consumeNumber() {
 	/*
 		int64_value:
@@ -227,7 +237,7 @@ func (p *parser) consumeNumber() {
 			[-]0—9+
 
 		hex_value:
-			[-]0x{0—9|a—f|A—F}+
+			[-]0[xX]{0—9|a—f|A—F}+
 
 		(float64_value is not formally specified)
 
@@ -247,7 +257,7 @@ func (p *parser) consumeNumber() {
 		// https://cloud.google.com/spanner/docs/lexical#integer-literals
 		i++
 	}
-	if strings.HasPrefix(p.s[i:], "0x") {
+	if strings.HasPrefix(p.s[i:], "0x") || strings.HasPrefix(p.s[i:], "0X") {
 		base = 16
 		i += 2
 	}
@@ -289,18 +299,18 @@ digitLoop:
 		p.errorf("no digits in numeric literal")
 		return
 	}
+	sign := ""
+	if neg {
+		sign = "-"
+	}
 	p.cur.value, p.s = p.s[:i], p.s[i:]
 	var err error
 	if float {
 		p.cur.typ = float64Token
-		p.cur.float64, err = strconv.ParseFloat(p.cur.value[d0:], 64)
+		p.cur.float64, err = strconv.ParseFloat(sign+p.cur.value[d0:], 64)
 	} else {
 		p.cur.typ = int64Token
-		p.cur.int64, err = strconv.ParseInt(p.cur.value[d0:], base, 64)
-	}
-	if neg {
-		p.cur.float64 = -p.cur.float64
-		p.cur.int64 = -p.cur.int64
+		p.cur.int64, err = strconv.ParseInt(sign+p.cur.value[d0:], base, 64)
 	}
 	if err != nil {
 		p.errorf("bad numeric literal %q: %v", p.cur.value, err)
@@ -308,39 +318,214 @@ digitLoop:
 }
 
 func (p *parser) consumeString() {
-	// TODO: support all the other string literal types.
 	// https://cloud.google.com/spanner/docs/lexical#string-and-bytes-literals
 
-	i := 0
-	if p.s[i] != '"' {
-		p.errorf("invalid string literal")
+	delim := p.stringDelimiter()
+	if p.cur.err != nil {
 		return
 	}
-	i++
+
+	p.cur.string, p.cur.err = p.consumeStringContent(delim, false, true, "string literal")
+	p.cur.typ = stringToken
+}
+
+func (p *parser) consumeRawString() {
+	// https://cloud.google.com/spanner/docs/lexical#string-and-bytes-literals
+
+	p.s = p.s[1:] // consume 'R'
+	delim := p.stringDelimiter()
+	if p.cur.err != nil {
+		return
+	}
+
+	p.cur.string, p.cur.err = p.consumeStringContent(delim, true, true, "raw string literal")
+	p.cur.typ = stringToken
+}
+
+func (p *parser) consumeBytes() {
+	// https://cloud.google.com/spanner/docs/lexical#string-and-bytes-literals
+
+	p.s = p.s[1:] // consume 'B'
+	delim := p.stringDelimiter()
+	if p.cur.err != nil {
+		return
+	}
+
+	p.cur.string, p.cur.err = p.consumeStringContent(delim, false, false, "bytes literal")
+	p.cur.typ = bytesToken
+}
+
+func (p *parser) consumeRawBytes() {
+	// https://cloud.google.com/spanner/docs/lexical#string-and-bytes-literals
+
+	p.s = p.s[2:] // consume 'RB'
+	delim := p.stringDelimiter()
+	if p.cur.err != nil {
+		return
+	}
+
+	p.cur.string, p.cur.err = p.consumeStringContent(delim, true, false, "raw bytes literal")
+	p.cur.typ = bytesToken
+}
+
+// stringDelimiter returns the opening string delimiter.
+func (p *parser) stringDelimiter() string {
+	c := p.s[0]
+	if c != '"' && c != '\'' {
+		p.errorf("invalid string literal")
+		return ""
+	}
+	// Look for triple.
+	if len(p.s) >= 3 && p.s[1] == c && p.s[2] == c {
+		return p.s[:3]
+	}
+	return p.s[:1]
+}
+
+// consumeStringContent consumes a string-like literal, including its delimiters.
+//
+//   - delim is opening delimiter.
+//   - raw is true on consuming raw string, otherwise it is false.
+//   - unicode is true if unicode escape sequence (\uXXXX or \UXXXXXXXX), otherwise it is false.
+//   - name is current consuming token name.
+//
+// It is designed for consuming string, bytes literals, and also backquoted identifiers.
+func (p *parser) consumeStringContent(delim string, raw, unicode bool, name string) (string, error) {
+	// https://cloud.google.com/spanner/docs/lexical#string-and-bytes-literals
+
+	if len(delim) == 3 {
+		name = "triple-quoted " + name
+	}
+
+	i := len(delim)
+	var content []byte
 
 	for i < len(p.s) {
-		c := p.s[i]
-		i++
-		if c == '"' {
-			break
+		if strings.HasPrefix(p.s[i:], delim) {
+			i += len(delim)
+			p.s = p.s[i:]
+			return string(content), nil
 		}
-		if c == '\\' && i < len(p.s) {
-			i++
-		}
-	}
-	if i > len(p.s) {
-		p.errorf("unterminated string literal")
-		return
-	}
-	p.cur.value, p.s = p.s[:i], p.s[i:]
-	p.cur.typ = stringToken
 
-	// TODO: this unescaping isn't entirely correct.
-	var err error
-	p.cur.string, err = strconv.Unquote(p.cur.value)
-	if err != nil {
-		p.errorf("invalid string literal [%s]: %v", p.cur.value, err)
+		if p.s[i] == '\\' {
+			i++
+			if i >= len(p.s) {
+				return "", p.errorf("unclosed %s", name)
+			}
+
+			if raw {
+				content = append(content, '\\', p.s[i])
+				i++
+				continue
+			}
+
+			switch p.s[i] {
+			case 'a':
+				i++
+				content = append(content, '\a')
+			case 'b':
+				i++
+				content = append(content, '\b')
+			case 'f':
+				i++
+				content = append(content, '\f')
+			case 'n':
+				i++
+				content = append(content, '\n')
+			case 'r':
+				i++
+				content = append(content, '\r')
+			case 't':
+				i++
+				content = append(content, '\t')
+			case 'v':
+				i++
+				content = append(content, '\v')
+			case '\\':
+				i++
+				content = append(content, '\\')
+			case '?':
+				i++
+				content = append(content, '?')
+			case '"':
+				i++
+				content = append(content, '"')
+			case '\'':
+				i++
+				content = append(content, '\'')
+			case '`':
+				i++
+				content = append(content, '`')
+			case 'x', 'X':
+				i++
+				if !(i+1 < len(p.s) && isHexDigit(p.s[i]) && isHexDigit(p.s[i+1])) {
+					return "", p.errorf("illegal escape sequence: hex escape sequence must be followed by 2 hex digits")
+				}
+				c, err := strconv.ParseUint(p.s[i:i+2], 16, 64)
+				if err != nil {
+					return "", p.errorf("illegal escape sequence: invalid hex digits: %q: %v", p.s[i:i+2], err)
+				}
+				content = append(content, byte(c))
+				i += 2
+			case 'u', 'U':
+				t := p.s[i]
+				if !unicode {
+					return "", p.errorf("illegal escape sequence: \\%c", t)
+				}
+
+				i++
+				size := 4
+				if t == 'U' {
+					size = 8
+				}
+				if i+size-1 >= len(p.s) {
+					return "", p.errorf("illegal escape sequence: \\%c escape sequence must be followed by %d hex digits", t, size)
+				}
+				for j := 0; j < size; j++ {
+					if !isHexDigit(p.s[i+j]) {
+						return "", p.errorf("illegal escape sequence: \\%c escape sequence must be followed by %d hex digits", t, size)
+					}
+				}
+				c, err := strconv.ParseUint(p.s[i:i+size], 16, 64)
+				if err != nil {
+					return "", p.errorf("illegal escape sequence: invalid \\%c digits: %q: %v", t, p.s[i:i+size], err)
+				}
+				if 0xD800 <= c && c <= 0xDFFF || 0x10FFFF < c {
+					return "", p.errorf("illegal escape sequence: invalid codepoint: %x", c)
+				}
+				var buf [utf8.UTFMax]byte
+				n := utf8.EncodeRune(buf[:], rune(c))
+				content = append(content, buf[:n]...)
+				i += size
+			case '0', '1', '2', '3', '4', '5', '6', '7':
+				if !(i+2 < len(p.s) && isOctalDigit(p.s[i+1]) && isOctalDigit(p.s[i+2])) {
+					return "", p.errorf("illegal escape sequence: octal escape sequence must be followed by 3 octal digits")
+				}
+				c, err := strconv.ParseUint(p.s[i:i+3], 8, 64)
+				if err != nil {
+					return "", p.errorf("illegal escape sequence: invalid octal digits: %q: %v", p.s[i:i+3], err)
+				}
+				if c >= 256 {
+					return "", p.errorf("illegal escape sequence: octal digits overflow: %q (%d)", p.s[i:i+3], c)
+				}
+				content = append(content, byte(c))
+				i += 3
+			default:
+				return "", p.errorf("illegal escape sequence: \\%c", p.s[i])
+			}
+
+			continue
+		}
+
+		if p.s[i] == '\n' && len(delim) != 3 { // newline is only allowed inside triple-quoted.
+			return "", p.errorf("newline forbidden in %s", name)
+		}
+
+		content = append(content, p.s[i])
+		i++
 	}
+
+	return "", p.errorf("unclosed %s", name)
 }
 
 var operators = map[string]bool{
@@ -410,10 +595,37 @@ func (p *parser) advance() {
 	// TODO: backtick (`) for quoted identifiers.
 	// TODO: array, struct, date, timestamp literals
 	switch p.s[0] {
-	case ',', ';', '(', ')':
+	case ',', ';', '(', ')', '*':
 		// Single character symbol.
 		p.cur.value, p.s = p.s[:1], p.s[1:]
 		return
+	// String literal prefix.
+	case 'B', 'b', 'R', 'r', '"', '\'':
+		// "B", "b", "BR", "Rb" etc are valid string literal prefix, however "BB", "rR" etc are not.
+		raw, bytes := false, false
+		for i := 0; i < 4 && i < len(p.s); i++ {
+			switch {
+			case !raw && (p.s[i] == 'R' || p.s[i] == 'r'):
+				raw = true
+				continue
+			case !bytes && (p.s[i] == 'B' || p.s[i] == 'b'):
+				bytes = true
+				continue
+			case p.s[i] == '"' || p.s[i] == '\'':
+				switch {
+				case raw && bytes:
+					p.consumeRawBytes()
+				case raw:
+					p.consumeRawString()
+				case bytes:
+					p.consumeBytes()
+				default:
+					p.consumeString()
+				}
+				return
+			}
+			break
+		}
 	}
 	if p.s[0] == '@' || isInitialIdentifierChar(p.s[0]) {
 		// Start consuming identifier.
@@ -440,14 +652,10 @@ func (p *parser) advance() {
 		p.cur.value, p.s = p.s[:1], p.s[1:]
 		return
 	}
-	if p.s[0] == '"' {
-		p.consumeString()
-		return
-	}
 
 	// Look for operator (two or one bytes).
 	for i := 2; i >= 1; i-- {
-		if i < len(p.s) && operators[p.s[:i]] {
+		if i <= len(p.s) && operators[p.s[:i]] {
 			p.cur.value, p.s = p.s[:i], p.s[i:]
 			return
 		}
@@ -499,6 +707,23 @@ func (p *parser) sniff(want ...string) bool {
 	return true
 }
 
+// eat reports whether the next N tokens are as specified,
+// then consumes them.
+func (p *parser) eat(want ...string) bool {
+	// Store current parser state so we can restore if we get a failure.
+	orig := *p
+
+	for _, w := range want {
+		tok := p.next()
+		if tok.err != nil || tok.value != w {
+			// Mismatch.
+			*p = orig
+			return false
+		}
+	}
+	return true
+}
+
 func (p *parser) expect(want string) error {
 	tok := p.next()
 	if tok.err != nil {
@@ -523,17 +748,18 @@ func (p *parser) parseDDLStmt() (DDLStmt, error) {
 	if p.sniff("CREATE", "TABLE") {
 		ct, err := p.parseCreateTable()
 		return ct, err
-	} else if p.sniff("CREATE", "INDEX") {
+	} else if p.sniff("CREATE") {
+		// The only other statement starting with CREATE is CREATE INDEX,
+		// which can have UNIQUE or NULL_FILTERED as the token after CREATE.
 		ci, err := p.parseCreateIndex()
 		return ci, err
 	} else if p.sniff("ALTER", "TABLE") {
 		a, err := p.parseAlterTable()
 		return a, err
-	} else if p.sniff("DROP") {
+	} else if p.eat("DROP") {
 		// These statements are simple.
 		//	DROP TABLE table_name
 		//	DROP INDEX index_name
-		p.expect("DROP")
 		tok := p.next()
 		if tok.err != nil {
 			return nil, tok.err
@@ -565,6 +791,9 @@ func (p *parser) parseCreateTable() (CreateTable, error) {
 
 		primary_key:
 			PRIMARY KEY ( [key_part, ...] )
+
+		cluster:
+			INTERLEAVE IN PARENT table_name [ ON DELETE { CASCADE | NO ACTION } ]
 	*/
 
 	if err := p.expect("CREATE"); err != nil {
@@ -577,35 +806,18 @@ func (p *parser) parseCreateTable() (CreateTable, error) {
 	if err != nil {
 		return CreateTable{}, err
 	}
-	if err := p.expect("("); err != nil {
-		return CreateTable{}, err
-	}
 
 	ct := CreateTable{Name: tname}
-	for {
-		if err := p.expect(")"); err == nil {
-			break
-		}
-		p.back()
-
+	err = p.parseCommaList(func(p *parser) error {
 		cd, err := p.parseColumnDef()
 		if err != nil {
-			return CreateTable{}, err
+			return err
 		}
 		ct.Columns = append(ct.Columns, cd)
-
-		// ")" or "," should be next.
-		tok := p.next()
-		if tok.err != nil {
-			return CreateTable{}, err
-		}
-		if tok.value == ")" {
-			break
-		} else if tok.value == "," {
-			continue
-		} else {
-			return CreateTable{}, p.errorf(`got %q, want ")" or ","`, tok.value)
-		}
+		return nil
+	})
+	if err != nil {
+		return CreateTable{}, err
 	}
 
 	if err := p.expect("PRIMARY"); err != nil {
@@ -618,6 +830,32 @@ func (p *parser) parseCreateTable() (CreateTable, error) {
 	if err != nil {
 		return CreateTable{}, err
 	}
+
+	if p.eat(",", "INTERLEAVE") {
+		if err := p.expect("IN"); err != nil {
+			return CreateTable{}, err
+		}
+		if err := p.expect("PARENT"); err != nil {
+			return CreateTable{}, err
+		}
+		pname, err := p.parseTableOrIndexOrColumnName()
+		if err != nil {
+			return CreateTable{}, err
+		}
+		ct.Interleave = &Interleave{
+			Parent:   pname,
+			OnDelete: NoActionOnDelete,
+		}
+		// The ON DELETE clause is optional; it defaults to NoActionOnDelete.
+		if p.eat("ON", "DELETE") {
+			od, err := p.parseOnDelete()
+			if err != nil {
+				return CreateTable{}, err
+			}
+			ct.Interleave.OnDelete = od
+		}
+	}
+
 	return ct, nil
 }
 
@@ -630,12 +868,25 @@ func (p *parser) parseCreateIndex() (CreateIndex, error) {
 
 		index_name:
 			{a—z|A—Z}[{a—z|A—Z|0—9|_}+]
+
+		storing_clause:
+			STORING ( column_name [, ...] )
+
+		interleave_clause:
+			INTERLEAVE IN table_name
 	*/
+
+	var unique, nullFiltered bool
 
 	if err := p.expect("CREATE"); err != nil {
 		return CreateIndex{}, err
 	}
-	// TODO: UNIQUE, NULL_FILTERED
+	if p.eat("UNIQUE") {
+		unique = true
+	}
+	if p.eat("NULL_FILTERED") {
+		nullFiltered = true
+	}
 	if err := p.expect("INDEX"); err != nil {
 		return CreateIndex{}, err
 	}
@@ -650,11 +901,32 @@ func (p *parser) parseCreateIndex() (CreateIndex, error) {
 	if err != nil {
 		return CreateIndex{}, err
 	}
-	ci := CreateIndex{Name: iname, Table: tname}
+	ci := CreateIndex{
+		Name:  iname,
+		Table: tname,
+
+		Unique:       unique,
+		NullFiltered: nullFiltered,
+	}
 	ci.Columns, err = p.parseKeyPartList()
 	if err != nil {
 		return CreateIndex{}, err
 	}
+
+	if p.eat("STORING") {
+		ci.Storing, err = p.parseColumnNameList()
+		if err != nil {
+			return CreateIndex{}, err
+		}
+	}
+
+	if p.eat(",", "INTERLEAVE", "IN") {
+		ci.Interleave, err = p.parseTableOrIndexOrColumnName()
+		if err != nil {
+			return CreateIndex{}, err
+		}
+	}
+
 	return ci, nil
 }
 
@@ -719,21 +991,11 @@ func (p *parser) parseAlterTable() (AlterTable, error) {
 		if err := p.expect("DELETE"); err != nil {
 			return AlterTable{}, err
 		}
-		tok := p.next()
-		if tok.err != nil {
-			return AlterTable{}, tok.err
-		}
-		if tok.value == "CASCADE" {
-			a.Alteration = CascadeOnDelete
-			return a, nil
-		}
-		if tok.value != "NO" {
-			return AlterTable{}, p.errorf("got %q, want NO or CASCADE", tok.value)
-		}
-		if err := p.expect("ACTION"); err != nil {
+		od, err := p.parseOnDelete()
+		if err != nil {
 			return AlterTable{}, err
 		}
-		a.Alteration = NoActionOnDelete
+		a.Alteration = SetOnDelete{Action: od}
 		return a, nil
 	}
 	// TODO: "ALTER"
@@ -774,36 +1036,16 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 }
 
 func (p *parser) parseKeyPartList() ([]KeyPart, error) {
-	if err := p.expect("("); err != nil {
-		return nil, err
-	}
 	var list []KeyPart
-	for {
-		if err := p.expect(")"); err == nil {
-			break
-		}
-		p.back()
-
+	err := p.parseCommaList(func(p *parser) error {
 		kp, err := p.parseKeyPart()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		list = append(list, kp)
-
-		// ")" or "," should be next.
-		tok := p.next()
-		if tok.err != nil {
-			return nil, err
-		}
-		if tok.value == ")" {
-			break
-		} else if tok.value == "," {
-			continue
-		} else {
-			return nil, p.errorf(`got %q, want ")" or ","`, tok.value)
-		}
-	}
-	return list, nil
+		return nil
+	})
+	return list, err
 }
 
 func (p *parser) parseKeyPart() (KeyPart, error) {
@@ -836,6 +1078,19 @@ func (p *parser) parseKeyPart() (KeyPart, error) {
 	}
 
 	return kp, nil
+}
+
+func (p *parser) parseColumnNameList() ([]string, error) {
+	var list []string
+	err := p.parseCommaList(func(p *parser) error {
+		n, err := p.parseTableOrIndexOrColumnName()
+		if err != nil {
+			return err
+		}
+		list = append(list, n)
+		return nil
+	})
+	return list, err
 }
 
 var baseTypes = map[string]TypeBase{
@@ -941,9 +1196,7 @@ func (p *parser) parseQuery() (Query, error) {
 	}
 	q := Query{Select: sel}
 
-	if p.sniff("ORDER", "BY") {
-		p.expect("ORDER")
-		p.expect("BY")
+	if p.eat("ORDER", "BY") {
 		for {
 			o, err := p.parseOrder()
 			if err != nil {
@@ -951,15 +1204,13 @@ func (p *parser) parseQuery() (Query, error) {
 			}
 			q.Order = append(q.Order, o)
 
-			if !p.sniff(",") {
+			if !p.eat(",") {
 				break
 			}
-			p.expect(",")
 		}
 	}
 
-	if p.sniff("LIMIT") {
-		p.expect("LIMIT")
+	if p.eat("LIMIT") {
 		lim, err := p.parseLimitCount()
 		if err != nil {
 			return Query{}, err
@@ -998,31 +1249,35 @@ func (p *parser) parseSelect() (Select, error) {
 		}
 		sel.List = append(sel.List, expr)
 
-		if p.sniff(",") {
-			p.expect(",")
+		if p.eat(",") {
 			continue
 		}
 		break
 	}
 
-	if p.sniff("FROM") {
-		p.expect("FROM")
+	if p.eat("FROM") {
 		for {
 			from, err := p.parseSelectFrom()
 			if err != nil {
 				return Select{}, err
 			}
+			if p.sniff("TABLESAMPLE") {
+				ts, err := p.parseTableSample()
+				if err != nil {
+					return Select{}, err
+				}
+				from.TableSample = &ts
+			}
 			sel.From = append(sel.From, from)
-			if p.sniff(",") {
-				p.expect(",")
+
+			if p.eat(",") {
 				continue
 			}
 			break
 		}
 	}
 
-	if p.sniff("WHERE") {
-		p.expect("WHERE")
+	if p.eat("WHERE") {
 		where, err := p.parseBoolExpr()
 		if err != nil {
 			return Select{}, err
@@ -1039,6 +1294,56 @@ func (p *parser) parseSelectFrom() (SelectFrom, error) {
 	// TODO: support more than a single table name.
 	tname, err := p.parseTableOrIndexOrColumnName()
 	return SelectFrom{Table: tname}, err
+}
+
+func (p *parser) parseTableSample() (TableSample, error) {
+	var ts TableSample
+
+	if err := p.expect("TABLESAMPLE"); err != nil {
+		return ts, err
+	}
+
+	tok := p.next()
+	switch {
+	case tok.err != nil:
+		return ts, tok.err
+	case tok.value == "BERNOULLI":
+		ts.Method = Bernoulli
+	case tok.value == "RESERVOIR":
+		ts.Method = Reservoir
+	default:
+		return ts, p.errorf("got %q, want BERNOULLI or RESERVOIR", tok.value)
+	}
+
+	if err := p.expect("("); err != nil {
+		return ts, err
+	}
+
+	// The docs say "numeric_value_expression" here,
+	// but that doesn't appear to be defined anywhere.
+	size, err := p.parseExpr()
+	if err != nil {
+		return ts, err
+	}
+	ts.Size = size
+
+	tok = p.next()
+	switch {
+	case tok.err != nil:
+		return ts, tok.err
+	case tok.value == "PERCENT":
+		ts.SizeType = PercentTableSample
+	case tok.value == "ROWS":
+		ts.SizeType = RowsTableSample
+	default:
+		return ts, p.errorf("got %q, want PERCENT or ROWS", tok.value)
+	}
+
+	if err := p.expect(")"); err != nil {
+		return ts, err
+	}
+
+	return ts, nil
 }
 
 func (p *parser) parseOrder() (Order, error) {
@@ -1082,6 +1387,19 @@ func (p *parser) parseLimitCount() (Limit, error) {
 	return nil, p.errorf("got %q, want literal or parameter", tok.value)
 }
 
+func (p *parser) parseExprList() ([]Expr, error) {
+	var list []Expr
+	err := p.parseCommaList(func(p *parser) error {
+		e, err := p.parseExpr()
+		if err != nil {
+			return err
+		}
+		list = append(list, e)
+		return nil
+	})
+	return list, err
+}
+
 /*
 Expressions
 
@@ -1097,9 +1415,10 @@ ascending order of precedence:
 	andParser
 	parseIsOp
 	parseComparisonOp
+	parseArithOp
 	parseLit
 
-TODO: there are more levels to break out.
+TODO: there are more levels to break out, esp. in parseArithOp
 */
 
 func (p *parser) parseExpr() (Expr, error) {
@@ -1124,10 +1443,9 @@ func (bin binOpParser) parse(p *parser) (Expr, error) {
 	}
 
 	for {
-		if !p.sniff(bin.Op) {
+		if !p.eat(bin.Op) {
 			break
 		}
-		p.expect(bin.Op)
 		rhs, err := bin.RHS(p)
 		if err != nil {
 			return nil, err
@@ -1179,10 +1497,9 @@ var (
 )
 
 func (p *parser) parseLogicalNot() (Expr, error) {
-	if !p.sniff("NOT") {
+	if !p.eat("NOT") {
 		return p.parseIsOp()
 	}
-	p.expect("NOT")
 	be, err := p.parseBoolExpr()
 	if err != nil {
 		return nil, err
@@ -1205,8 +1522,7 @@ func (p *parser) parseIsOp() (Expr, error) {
 	}
 
 	isOp := IsOp{LHS: expr}
-	if p.sniff("NOT") {
-		p.expect("NOT")
+	if p.eat("NOT") {
 		isOp.Neg = true
 	}
 
@@ -1241,9 +1557,7 @@ var symbolicOperators = map[string]ComparisonOperator{
 func (p *parser) parseComparisonOp() (Expr, error) {
 	debugf("parseComparisonOp: %v", p)
 
-	// TODO: this should be parsing bitwise/arithmetic subexpressions.
-
-	expr, err := p.parseLit()
+	expr, err := p.parseArithOp()
 	if err != nil {
 		return nil, err
 	}
@@ -1255,15 +1569,25 @@ func (p *parser) parseComparisonOp() (Expr, error) {
 			break
 		}
 		var op ComparisonOperator
-		var ok bool
+		var ok, rhs2 bool
 		if tok.value == "NOT" {
-			if err := p.expect("LIKE"); err != nil {
+			tok := p.next()
+			switch {
+			case tok.err != nil:
 				// TODO: Does this need to push back two?
 				return nil, err
+			case tok.value == "LIKE":
+				op, ok = NotLike, true
+			case tok.value == "BETWEEN":
+				op, ok, rhs2 = NotBetween, true, true
+			default:
+				// TODO: Does this need to push back two?
+				return nil, p.errorf("got %q, want LIKE or BETWEEN", tok.value)
 			}
-			op, ok = NotLike, true
 		} else if tok.value == "LIKE" {
 			op, ok = Like, true
+		} else if tok.value == "BETWEEN" {
+			op, ok, rhs2 = Between, true, true
 		} else {
 			op, ok = symbolicOperators[tok.value]
 		}
@@ -1272,13 +1596,61 @@ func (p *parser) parseComparisonOp() (Expr, error) {
 			break
 		}
 
-		rhs, err := p.parseLit()
+		rhs, err := p.parseArithOp()
 		if err != nil {
 			return nil, err
 		}
-		expr = ComparisonOp{LHS: expr, Op: op, RHS: rhs}
+		co := ComparisonOp{LHS: expr, Op: op, RHS: rhs}
+
+		if rhs2 {
+			if err := p.expect("AND"); err != nil {
+				return nil, err
+			}
+			rhs2, err := p.parseArithOp()
+			if err != nil {
+				return nil, err
+			}
+			co.RHS2 = rhs2
+		}
+
+		expr = co
 	}
 	return expr, nil
+}
+
+func (p *parser) parseArithOp() (Expr, error) {
+	// TODO: actually parse arithmetic operations.
+
+	if p.eat("(") {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		return Paren{Expr: e}, nil
+	}
+
+	lit, err := p.parseLit()
+	if err != nil {
+		return nil, err
+	}
+
+	// If the literal was an identifier, and there's an open paren next,
+	// this is a function invocation.
+	if id, ok := lit.(ID); ok && p.sniff("(") {
+		list, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		return Func{
+			Name: string(id),
+			Args: list,
+		}, nil
+	}
+
+	return lit, nil
 }
 
 func (p *parser) parseLit() (Expr, error) {
@@ -1294,9 +1666,11 @@ func (p *parser) parseLit() (Expr, error) {
 		return FloatLiteral(tok.float64), nil
 	case stringToken:
 		return StringLiteral(tok.string), nil
+	case bytesToken:
+		return BytesLiteral(tok.string), nil
 	}
 
-	// Handle some reserved keywords that become specific values.
+	// Handle some reserved keywords and special tokens that become specific values.
 	// TODO: Handle the other 92 keywords.
 	switch tok.value {
 	case "TRUE":
@@ -1305,6 +1679,8 @@ func (p *parser) parseLit() (Expr, error) {
 		return False, nil
 	case "NULL":
 		return Null, nil
+	case "*":
+		return Star, nil
 	}
 
 	// TODO: more types of literals (array, struct, date, timestamp).
@@ -1341,4 +1717,57 @@ func (p *parser) parseTableOrIndexOrColumnName() (string, error) {
 	}
 	// TODO: enforce restrictions
 	return tok.value, nil
+}
+
+func (p *parser) parseOnDelete() (OnDelete, error) {
+	/*
+		CASCADE
+		NO ACTION
+	*/
+
+	tok := p.next()
+	if tok.err != nil {
+		return 0, tok.err
+	}
+	if tok.value == "CASCADE" {
+		return CascadeOnDelete, nil
+	}
+	if tok.value != "NO" {
+		return 0, p.errorf("got %q, want NO or CASCADE", tok.value)
+	}
+	if err := p.expect("ACTION"); err != nil {
+		return 0, err
+	}
+	return NoActionOnDelete, nil
+}
+
+// parseCommaList parses a parenthesized comma-separated list,
+// delegating to f for the individual element parsing.
+func (p *parser) parseCommaList(f func(*parser) error) error {
+	if err := p.expect("("); err != nil {
+		return err
+	}
+	for {
+		if p.eat(")") {
+			return nil
+		}
+
+		err := f(p)
+		if err != nil {
+			return err
+		}
+
+		// ")" or "," should be next.
+		tok := p.next()
+		if tok.err != nil {
+			return err
+		}
+		if tok.value == ")" {
+			return nil
+		} else if tok.value == "," {
+			continue
+		} else {
+			return p.errorf(`got %q, want ")" or ","`, tok.value)
+		}
+	}
 }

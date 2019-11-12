@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -53,7 +54,7 @@ var (
 	ErrObjectNotExist = errors.New("storage: object doesn't exist")
 )
 
-const userAgent = "gcloud-golang-storage/20151204"
+var userAgent = fmt.Sprintf("gcloud-golang-storage/%s", version.Repo)
 
 const (
 	// ScopeFullControl grants permissions to manage your
@@ -82,16 +83,31 @@ func setClientHeader(headers http.Header) {
 type Client struct {
 	hc  *http.Client
 	raw *raw.Service
+	// Scheme describes the scheme under the current host.
+	scheme string
+	// EnvHost is the host set on the STORAGE_EMULATOR_HOST variable.
+	envHost string
+	// ReadHost is the default host used on the reader.
+	readHost string
 }
 
 // NewClient creates a new Google Cloud Storage client.
 // The default scope is ScopeFullControl. To use a different scope, like ScopeReadOnly, use option.WithScopes.
 func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error) {
-	o := []option.ClientOption{
-		option.WithScopes(ScopeFullControl),
-		option.WithUserAgent(userAgent),
+	var host, readHost, scheme string
+
+	if host = os.Getenv("STORAGE_EMULATOR_HOST"); host == "" {
+		scheme = "https"
+		readHost = "storage.googleapis.com"
+
+		opts = append(opts, option.WithScopes(ScopeFullControl), option.WithUserAgent(userAgent))
+	} else {
+		scheme = "http"
+		readHost = host
+
+		opts = append(opts, option.WithoutAuthentication())
 	}
-	opts = append(o, opts...)
+
 	hc, ep, err := htransport.NewClient(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dialing: %v", err)
@@ -100,12 +116,20 @@ func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error
 	if err != nil {
 		return nil, fmt.Errorf("storage client: %v", err)
 	}
-	if ep != "" {
+	if ep == "" {
+		// Override the default value for BasePath from the raw client.
+		// TODO: remove when the raw client uses this endpoint as its default (~end of 2020)
+		rawService.BasePath = "https://storage.googleapis.com/storage/v1/"
+	} else {
 		rawService.BasePath = ep
 	}
+
 	return &Client{
-		hc:  hc,
-		raw: rawService,
+		hc:       hc,
+		raw:      rawService,
+		scheme:   scheme,
+		envHost:  host,
+		readHost: readHost,
 	}, nil
 }
 
@@ -974,10 +998,8 @@ type ObjectAttrs struct {
 	// StorageClass is the storage class of the object.
 	// This value defines how objects in the bucket are stored and
 	// determines the SLA and the cost of storage. Typical values are
-	// "MULTI_REGIONAL", "REGIONAL", "NEARLINE", "COLDLINE", "STANDARD"
-	// and "DURABLE_REDUCED_AVAILABILITY".
-	// It defaults to "STANDARD", which is equivalent to "MULTI_REGIONAL"
-	// or "REGIONAL" depending on the bucket's location settings.
+	// "NEARLINE", "COLDLINE" and "STANDARD".
+	// It defaults to "STANDARD".
 	StorageClass string
 
 	// Created is the time the object was created. This field is read-only.

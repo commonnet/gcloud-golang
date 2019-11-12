@@ -17,12 +17,6 @@
 package dialogflow
 
 import (
-	emptypb "github.com/golang/protobuf/ptypes/empty"
-	dialogflowpb "google.golang.org/genproto/googleapis/cloud/dialogflow/v2"
-	longrunningpb "google.golang.org/genproto/googleapis/longrunning"
-)
-
-import (
 	"context"
 	"flag"
 	"fmt"
@@ -35,11 +29,16 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
+	emptypb "github.com/golang/protobuf/ptypes/empty"
 	"google.golang.org/api/option"
+	dialogflowpb "google.golang.org/genproto/googleapis/cloud/dialogflow/v2"
+	longrunningpb "google.golang.org/genproto/googleapis/longrunning"
+
 	status "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+
 	gstatus "google.golang.org/grpc/status"
 )
 
@@ -653,7 +652,7 @@ func TestAgentsSetAgent(t *testing.T) {
 	var description string = "description-1724546052"
 	var avatarUri string = "avatarUri-402824826"
 	var enableLogging bool = false
-	var classificationThreshold float32 = 1.11581064E8
+	var classificationThreshold float32 = 1.11581064e8
 	var expectedResponse = &dialogflowpb.Agent{
 		Parent:                  parent,
 		DisplayName:             displayName,
@@ -778,7 +777,7 @@ func TestAgentsGetAgent(t *testing.T) {
 	var description string = "description-1724546052"
 	var avatarUri string = "avatarUri-402824826"
 	var enableLogging bool = false
-	var classificationThreshold float32 = 1.11581064E8
+	var classificationThreshold float32 = 1.11581064e8
 	var expectedResponse = &dialogflowpb.Agent{
 		Parent:                  parent2,
 		DisplayName:             displayName,
@@ -1674,9 +1673,11 @@ func TestEntityTypesListEntityTypesError(t *testing.T) {
 func TestEntityTypesGetEntityType(t *testing.T) {
 	var name2 string = "name2-1052831874"
 	var displayName string = "displayName1615086568"
+	var enableFuzzyExtraction bool = true
 	var expectedResponse = &dialogflowpb.EntityType{
-		Name:        name2,
-		DisplayName: displayName,
+		Name:                  name2,
+		DisplayName:           displayName,
+		EnableFuzzyExtraction: enableFuzzyExtraction,
 	}
 
 	mockEntityTypes.err = nil
@@ -1735,9 +1736,11 @@ func TestEntityTypesGetEntityTypeError(t *testing.T) {
 func TestEntityTypesCreateEntityType(t *testing.T) {
 	var name string = "name3373707"
 	var displayName string = "displayName1615086568"
+	var enableFuzzyExtraction bool = true
 	var expectedResponse = &dialogflowpb.EntityType{
-		Name:        name,
-		DisplayName: displayName,
+		Name:                  name,
+		DisplayName:           displayName,
+		EnableFuzzyExtraction: enableFuzzyExtraction,
 	}
 
 	mockEntityTypes.err = nil
@@ -1800,9 +1803,11 @@ func TestEntityTypesCreateEntityTypeError(t *testing.T) {
 func TestEntityTypesUpdateEntityType(t *testing.T) {
 	var name string = "name3373707"
 	var displayName string = "displayName1615086568"
+	var enableFuzzyExtraction bool = true
 	var expectedResponse = &dialogflowpb.EntityType{
-		Name:        name,
-		DisplayName: displayName,
+		Name:                  name,
+		DisplayName:           displayName,
+		EnableFuzzyExtraction: enableFuzzyExtraction,
 	}
 
 	mockEntityTypes.err = nil
